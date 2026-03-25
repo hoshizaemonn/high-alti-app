@@ -1,0 +1,502 @@
+"""PL Dashboard page — monthly and annual views."""
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from database import (
+    get_payroll_data, get_expense_data, get_revenue_data,
+    get_available_years, get_available_months,
+    STORES, EXPENSE_CATEGORIES,
+)
+
+
+def _fmt(val: float) -> str:
+    """Format yen amount."""
+    if val >= 0:
+        return f"¥{val:,.0f}"
+    return f"-¥{abs(val):,.0f}"
+
+
+def _fmt_pct(val: float) -> str:
+    return f"{val:.1f}%"
+
+
+def _kpi_card(label: str, value: float, delta: float = None, inverse: bool = False):
+    """Render a KPI metric."""
+    if delta is not None:
+        st.metric(label, _fmt(value), f"{delta:+,.0f}", delta_color="inverse" if inverse else "normal")
+    else:
+        st.metric(label, _fmt(value))
+
+
+def _compute_payroll_summary(payroll_records: list[dict]) -> dict:
+    """Compute payroll aggregates from records."""
+    if not payroll_records:
+        return {
+            "gross_total": 0, "base_salary": 0, "position_allowance": 0,
+            "overtime_pay": 0, "commute_total": 0, "taxable_total": 0,
+            "legal_welfare": 0, "total_labor_cost": 0,
+            "scheduled_hours": 0, "overtime_hours": 0,
+            "employee_count": 0, "fulltime_count": 0, "parttime_count": 0,
+        }
+
+    df = pd.DataFrame(payroll_records)
+    gross = df["gross_total"].sum()
+    base = df["base_salary"].sum()
+    position = df["position_allowance"].sum()
+    overtime_pay = df["overtime_pay"].sum()
+    commute = df["commute_taxable"].sum() + df["commute_nontax"].sum()
+    taxable = df["taxable_total"].sum()
+    sched_hours = df["scheduled_hours"].sum()
+    ot_hours = df["overtime_hours"].sum()
+
+    welfare = (
+        df["health_insurance_co"].sum()
+        + df["care_insurance_co"].sum()
+        + df["pension_co"].sum()
+        + df["child_contribution_co"].sum()
+        + df["pension_fund_co"].sum()
+        + df["employment_insurance_co"].sum()
+        + df["workers_comp_co"].sum()
+        + df["general_contribution_co"].sum()
+    )
+
+    unique_emp = df["employee_id"].nunique()
+    ft = df[df["contract_type"] == "正社員"]["employee_id"].nunique()
+    pt = df[df["contract_type"] == "アルバイト"]["employee_id"].nunique()
+
+    return {
+        "gross_total": gross,
+        "base_salary": base,
+        "position_allowance": position,
+        "overtime_pay": overtime_pay,
+        "commute_total": commute,
+        "taxable_total": taxable,
+        "legal_welfare": welfare,
+        "total_labor_cost": gross + welfare,
+        "scheduled_hours": sched_hours,
+        "overtime_hours": ot_hours,
+        "employee_count": unique_emp,
+        "fulltime_count": ft,
+        "parttime_count": pt,
+    }
+
+
+def _compute_expense_summary(expense_records: list[dict]) -> dict:
+    """Compute expense aggregates from records."""
+    if not expense_records:
+        return {"total": 0, "by_category": {}, "revenue_items": 0}
+
+    df = pd.DataFrame(expense_records)
+    expense_df = df[df["is_revenue"] == 0]
+    revenue_df = df[df["is_revenue"] == 1]
+
+    total = expense_df["amount"].sum()
+    by_cat = {}
+    if not expense_df.empty:
+        grouped = expense_df.groupby("category")["amount"].sum()
+        by_cat = grouped.to_dict()
+
+    return {
+        "total": total,
+        "by_category": by_cat,
+        "revenue_items": revenue_df["deposit"].sum(),
+    }
+
+
+def _compute_revenue_summary(revenue_records: list[dict]) -> dict:
+    if not revenue_records:
+        return {"total": 0, "by_store": {}, "member_count": 0}
+
+    df = pd.DataFrame(revenue_records)
+    total = df["amount"].sum()
+    by_store = df.groupby("store_name")["amount"].sum().to_dict()
+    members = df["member_count"].sum()
+
+    return {"total": total, "by_store": by_store, "member_count": members}
+
+
+def _render_monthly(year: int, month: int, store: str):
+    """Render monthly PL view."""
+    payroll = get_payroll_data(year, month, store)
+    expenses = get_expense_data(year, month, store)
+    revenue = get_revenue_data(year, month, store)
+
+    pay_sum = _compute_payroll_summary(payroll)
+    exp_sum = _compute_expense_summary(expenses)
+    rev_sum = _compute_revenue_summary(revenue)
+
+    total_revenue = rev_sum["total"]
+    total_labor = pay_sum["total_labor_cost"]
+    total_expense = exp_sum["total"]
+    operating_profit = total_revenue - total_labor - total_expense
+
+    # KPI Cards
+    st.markdown(f"### {year}年{month}月 — {store}")
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        _kpi_card("売上合計", total_revenue)
+    with k2:
+        _kpi_card("人件費合計", total_labor, inverse=True)
+    with k3:
+        _kpi_card("経費合計", total_expense, inverse=True)
+    with k4:
+        _kpi_card("営業利益", operating_profit)
+
+    # PL Table
+    st.markdown("---")
+    st.subheader("損益計算書（PL）")
+
+    pl_rows = []
+
+    # Revenue section
+    pl_rows.append({"科目": "【売上高】", "金額": "", "_bold": True})
+    if rev_sum["by_store"]:
+        for s, amt in rev_sum["by_store"].items():
+            pl_rows.append({"科目": f"  {s}", "金額": _fmt(amt)})
+    else:
+        pl_rows.append({"科目": "  売上", "金額": _fmt(total_revenue)})
+    pl_rows.append({"科目": "売上合計", "金額": _fmt(total_revenue), "_bold": True})
+
+    pl_rows.append({"科目": "", "金額": ""})
+
+    # Labor cost section
+    pl_rows.append({"科目": "【人件費】", "金額": "", "_bold": True})
+    pl_rows.append({"科目": "  基本給", "金額": _fmt(pay_sum["base_salary"])})
+    pl_rows.append({"科目": "  役職手当", "金額": _fmt(pay_sum["position_allowance"])})
+    pl_rows.append({"科目": "  残業手当", "金額": _fmt(pay_sum["overtime_pay"])})
+    pl_rows.append({"科目": "  通勤手当", "金額": _fmt(pay_sum["commute_total"])})
+    other_pay = pay_sum["gross_total"] - pay_sum["base_salary"] - pay_sum["position_allowance"] - pay_sum["overtime_pay"] - pay_sum["commute_total"]
+    if other_pay > 0:
+        pl_rows.append({"科目": "  その他手当", "金額": _fmt(other_pay)})
+    pl_rows.append({"科目": "  支給合計", "金額": _fmt(pay_sum["gross_total"]), "_bold": True})
+    pl_rows.append({"科目": "  法定福利費（会社負担）", "金額": _fmt(pay_sum["legal_welfare"])})
+    pl_rows.append({"科目": "人件費合計", "金額": _fmt(total_labor), "_bold": True})
+
+    pl_rows.append({"科目": "", "金額": ""})
+
+    # Expense section
+    pl_rows.append({"科目": "【経費】", "金額": "", "_bold": True})
+    for cat in EXPENSE_CATEGORIES:
+        amt = exp_sum["by_category"].get(cat, 0)
+        if amt > 0:
+            pl_rows.append({"科目": f"  {cat}", "金額": _fmt(amt)})
+    uncat = exp_sum["by_category"].get(None, 0)
+    if uncat > 0:
+        pl_rows.append({"科目": "  未分類", "金額": _fmt(uncat)})
+    pl_rows.append({"科目": "経費合計", "金額": _fmt(total_expense), "_bold": True})
+
+    pl_rows.append({"科目": "", "金額": ""})
+
+    # Operating profit
+    pl_rows.append({"科目": "【営業利益】", "金額": _fmt(operating_profit), "_bold": True})
+    if total_revenue > 0:
+        pl_rows.append({"科目": "  営業利益率", "金額": _fmt_pct(operating_profit / total_revenue * 100)})
+        pl_rows.append({"科目": "  人件費率", "金額": _fmt_pct(total_labor / total_revenue * 100)})
+
+    # Render as styled table
+    display_rows = []
+    for r in pl_rows:
+        display_rows.append({"科目": r["科目"], "金額": r["金額"]})
+
+    df_pl = pd.DataFrame(display_rows)
+    st.dataframe(df_pl, use_container_width=True, hide_index=True, height=len(display_rows) * 36 + 38)
+
+    # Employee drill-down
+    st.markdown("---")
+    st.subheader("従業員別明細")
+
+    if payroll:
+        df_emp = pd.DataFrame(payroll)
+
+        # Compute per-employee total cost and hourly rate
+        df_emp["法定福利"] = (
+            df_emp["health_insurance_co"] + df_emp["care_insurance_co"]
+            + df_emp["pension_co"] + df_emp["child_contribution_co"]
+            + df_emp["pension_fund_co"] + df_emp["employment_insurance_co"]
+            + df_emp["workers_comp_co"] + df_emp["general_contribution_co"]
+        )
+        df_emp["人件費合計"] = df_emp["gross_total"] + df_emp["法定福利"]
+        df_emp["総労働時間"] = df_emp["scheduled_hours"] + df_emp["overtime_hours"]
+        df_emp["時給単価"] = df_emp.apply(
+            lambda r: r["人件費合計"] / r["総労働時間"] if r["総労働時間"] > 0 else 0, axis=1
+        )
+
+        display_emp = df_emp[[
+            "store_name", "employee_name", "contract_type",
+            "base_salary", "position_allowance", "overtime_pay",
+            "gross_total", "法定福利", "人件費合計",
+            "scheduled_hours", "overtime_hours", "総労働時間", "時給単価",
+        ]].copy()
+
+        display_emp.columns = [
+            "店舗", "氏名", "契約種別",
+            "基本給", "役職手当", "残業手当",
+            "支給合計", "法定福利", "人件費合計",
+            "所定時間", "残業時間", "総労働時間", "時給単価",
+        ]
+
+        # Format currency columns
+        for col in ["基本給", "役職手当", "残業手当", "支給合計", "法定福利", "人件費合計"]:
+            display_emp[col] = display_emp[col].apply(lambda x: f"¥{x:,.0f}")
+
+        for col in ["所定時間", "残業時間", "総労働時間"]:
+            display_emp[col] = display_emp[col].apply(lambda x: f"{x:.1f}h")
+
+        display_emp["時給単価"] = display_emp["時給単価"].apply(lambda x: f"¥{x:,.0f}")
+
+        # Group by store with expander
+        for store_name in sorted(df_emp["store_name"].unique()):
+            store_df = display_emp[display_emp["店舗"] == store_name].drop(columns=["店舗"])
+            with st.expander(f"{store_name}（{len(store_df)}名）"):
+                st.dataframe(store_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("人件費データがありません。")
+
+    # Expense detail
+    if expenses:
+        st.markdown("---")
+        st.subheader("経費明細")
+        df_exp = pd.DataFrame(expenses)
+        df_exp_display = df_exp[df_exp["is_revenue"] == 0][["day", "description", "amount", "category"]].copy()
+        df_exp_display.columns = ["日", "摘要", "金額", "勘定科目"]
+        df_exp_display["金額"] = df_exp_display["金額"].apply(lambda x: f"¥{x:,.0f}")
+        df_exp_display["勘定科目"] = df_exp_display["勘定科目"].fillna("未分類")
+        st.dataframe(df_exp_display, use_container_width=True, hide_index=True)
+
+
+def _render_annual(year: int, store: str):
+    """Render annual PL view with charts."""
+    available_months = get_available_months(year)
+
+    monthly_data = []
+    for m in range(1, 13):
+        payroll = get_payroll_data(year, m, store)
+        expenses = get_expense_data(year, m, store)
+        revenue = get_revenue_data(year, m, store)
+
+        pay_sum = _compute_payroll_summary(payroll)
+        exp_sum = _compute_expense_summary(expenses)
+        rev_sum = _compute_revenue_summary(revenue)
+
+        total_labor = pay_sum["total_labor_cost"]
+        total_expense = exp_sum["total"]
+        total_rev = rev_sum["total"]
+
+        monthly_data.append({
+            "month": m,
+            "month_label": f"{m}月",
+            "revenue": total_rev,
+            "labor_cost": total_labor,
+            "expense": total_expense,
+            "operating_profit": total_rev - total_labor - total_expense,
+            "gross_total": pay_sum["gross_total"],
+            "legal_welfare": pay_sum["legal_welfare"],
+            "member_count": rev_sum["member_count"],
+            "employee_count": pay_sum["employee_count"],
+            "fulltime_count": pay_sum["fulltime_count"],
+            "parttime_count": pay_sum["parttime_count"],
+            **{f"exp_{cat}": exp_sum["by_category"].get(cat, 0) for cat in EXPENSE_CATEGORIES},
+        })
+
+    df = pd.DataFrame(monthly_data)
+    has_data = df[df[["revenue", "labor_cost", "expense"]].sum(axis=1) > 0]
+
+    # Annual KPIs
+    ann_rev = df["revenue"].sum()
+    ann_labor = df["labor_cost"].sum()
+    ann_exp = df["expense"].sum()
+    ann_profit = ann_rev - ann_labor - ann_exp
+
+    st.markdown(f"### {year}年 年間 — {store}")
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        _kpi_card("売上合計（年間）", ann_rev)
+    with k2:
+        _kpi_card("人件費合計（年間）", ann_labor, inverse=True)
+    with k3:
+        _kpi_card("経費合計（年間）", ann_exp, inverse=True)
+    with k4:
+        _kpi_card("営業利益（年間）", ann_profit)
+
+    if has_data.empty:
+        st.info("表示するデータがありません。データをアップロードしてください。")
+        return
+
+    # Charts
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        # Revenue trend (stacked bar by category — for now just total since we don't have category breakdown)
+        fig_rev = go.Figure()
+        fig_rev.add_trace(go.Bar(
+            x=df["month_label"], y=df["revenue"],
+            name="売上", marker_color="#2196F3",
+        ))
+        fig_rev.update_layout(
+            title="売上推移", xaxis_title="月", yaxis_title="金額（円）",
+            height=350, margin=dict(l=20, r=20, t=40, b=20),
+        )
+        st.plotly_chart(fig_rev, use_container_width=True, key=f"chart_rev_{year}_{store}")
+
+    with c2:
+        # Member count trend
+        fig_mem = go.Figure()
+        fig_mem.add_trace(go.Scatter(
+            x=df["month_label"], y=df["member_count"],
+            mode="lines+markers", name="会員数",
+            line=dict(color="#4CAF50", width=3),
+            marker=dict(size=8),
+        ))
+        fig_mem.update_layout(
+            title="会員数推移", xaxis_title="月", yaxis_title="会員数",
+            height=350, margin=dict(l=20, r=20, t=40, b=20),
+        )
+        st.plotly_chart(fig_mem, use_container_width=True, key=f"chart_mem_{year}_{store}")
+
+    c3, c4 = st.columns(2)
+
+    with c3:
+        # Revenue vs Labor cost
+        fig_rl = go.Figure()
+        fig_rl.add_trace(go.Scatter(
+            x=df["month_label"], y=df["revenue"],
+            mode="lines+markers", name="売上",
+            line=dict(color="#2196F3", width=3),
+        ))
+        fig_rl.add_trace(go.Scatter(
+            x=df["month_label"], y=df["labor_cost"],
+            mode="lines+markers", name="人件費",
+            line=dict(color="#F44336", width=3),
+        ))
+        fig_rl.update_layout(
+            title="売上 vs 人件費", xaxis_title="月", yaxis_title="金額（円）",
+            height=350, margin=dict(l=20, r=20, t=40, b=20),
+        )
+        st.plotly_chart(fig_rl, use_container_width=True, key=f"chart_rl_{year}_{store}")
+
+    with c4:
+        # Store comparison (operating profit) — only meaningful for 全体
+        if store == "全体":
+            store_profits = {}
+            for s in STORES:
+                s_payroll = get_payroll_data(year, store=s)
+                s_expenses = get_expense_data(year, store=s)
+                s_rev = get_revenue_data(year, store=s)
+                s_pay_sum = _compute_payroll_summary(s_payroll)
+                s_exp_sum = _compute_expense_summary(s_expenses)
+                s_rev_sum = _compute_revenue_summary(s_rev)
+                profit = s_rev_sum["total"] - s_pay_sum["total_labor_cost"] - s_exp_sum["total"]
+                store_profits[s] = profit
+
+            fig_store = go.Figure()
+            colors = ["#F44336" if v < 0 else "#4CAF50" for v in store_profits.values()]
+            fig_store.add_trace(go.Bar(
+                x=list(store_profits.keys()),
+                y=list(store_profits.values()),
+                marker_color=colors,
+            ))
+            fig_store.update_layout(
+                title="店舗別 営業利益",
+                xaxis_title="店舗", yaxis_title="営業利益（円）",
+                height=350, margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(fig_store, use_container_width=True, key=f"chart_store_{year}_{store}")
+        else:
+            # Single store — show expense breakdown pie
+            exp_cats = {cat: df[f"exp_{cat}"].sum() for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0}
+            if exp_cats:
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=list(exp_cats.keys()),
+                    values=list(exp_cats.values()),
+                    hole=0.4,
+                )])
+                fig_pie.update_layout(
+                    title="経費内訳", height=350,
+                    margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_pie, use_container_width=True, key=f"chart_pie_{year}_{store}")
+
+    # Annual cumulative PL table
+    st.markdown("---")
+    st.subheader("年間PL一覧")
+
+    table_data = {
+        "科目": [
+            "売上高", "人件費（支給合計）", "法定福利費",
+            "人件費合計", "経費合計",
+        ] + [cat for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
+            "営業利益",
+        ],
+    }
+
+    for _, row in df.iterrows():
+        m_label = row["month_label"]
+        vals = [
+            row["revenue"], row["gross_total"], row["legal_welfare"],
+            row["labor_cost"], row["expense"],
+        ] + [row[f"exp_{cat}"] for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
+            row["operating_profit"],
+        ]
+        table_data[m_label] = [_fmt(v) for v in vals]
+
+    # Annual total and average
+    n_data_months = len(has_data) if len(has_data) > 0 else 1
+    total_vals = [
+        ann_rev, df["gross_total"].sum(), df["legal_welfare"].sum(),
+        ann_labor, ann_exp,
+    ] + [df[f"exp_{cat}"].sum() for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
+        ann_profit,
+    ]
+    avg_vals = [v / n_data_months for v in total_vals]
+
+    table_data["年間合計"] = [_fmt(v) for v in total_vals]
+    table_data["月平均"] = [_fmt(v) for v in avg_vals]
+
+    df_table = pd.DataFrame(table_data)
+    st.dataframe(df_table, use_container_width=True, hide_index=True)
+
+    # Headcount summary
+    st.markdown("---")
+    st.subheader("人員推移")
+    hc_data = {
+        "項目": ["正社員", "アルバイト", "合計"],
+    }
+    for _, row in df.iterrows():
+        hc_data[row["month_label"]] = [
+            row["fulltime_count"], row["parttime_count"], row["employee_count"]
+        ]
+    df_hc = pd.DataFrame(hc_data)
+    st.dataframe(df_hc, use_container_width=True, hide_index=True)
+
+
+def render():
+    years = get_available_years()
+    if not years:
+        st.info("データがまだアップロードされていません。「アップロード」ページからデータを取り込んでください。")
+        return
+
+    # Selectors in columns
+    col_year, col_period, col_store = st.columns(3)
+
+    with col_year:
+        selected_year = st.selectbox("年度", years, index=len(years) - 1, key="dash_year")
+
+    period_options = ["年間"] + [f"{m}月" for m in range(1, 13)]
+
+    with col_period:
+        selected_period = st.selectbox("期間", period_options, key="dash_period")
+
+    store_options = STORES + ["全体"]
+    with col_store:
+        selected_store = st.selectbox("店舗", store_options, key="dash_store")
+
+    st.markdown("---")
+
+    if selected_period == "年間":
+        _render_annual(selected_year, selected_store)
+    else:
+        month = int(selected_period.replace("月", ""))
+        _render_monthly(selected_year, month, selected_store)
