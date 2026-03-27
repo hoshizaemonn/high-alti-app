@@ -169,7 +169,7 @@ def init_db():
         )
     """)
 
-    # Member data from hacomono ML001
+    # Member data from hacomono ML001 (v2 — extended fields)
     c.execute("""
         CREATE TABLE IF NOT EXISTS member_data (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,9 +180,28 @@ def init_db():
             member_name TEXT,
             plan_name TEXT,
             join_date TEXT,
-            tenure TEXT
+            tenure TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            is_new INTEGER NOT NULL DEFAULT 0,
+            had_trial INTEGER NOT NULL DEFAULT 0,
+            plan_end_date TEXT,
+            trial_date TEXT,
+            first_trial_date TEXT,
+            initial_plan TEXT
         )
     """)
+
+    # Migration: add columns if they don't exist (for existing DBs)
+    try:
+        c.execute("SELECT is_active FROM member_data LIMIT 1")
+    except sqlite3.OperationalError:
+        c.execute("ALTER TABLE member_data ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+        c.execute("ALTER TABLE member_data ADD COLUMN is_new INTEGER NOT NULL DEFAULT 0")
+        c.execute("ALTER TABLE member_data ADD COLUMN had_trial INTEGER NOT NULL DEFAULT 0")
+        c.execute("ALTER TABLE member_data ADD COLUMN plan_end_date TEXT")
+        c.execute("ALTER TABLE member_data ADD COLUMN trial_date TEXT")
+        c.execute("ALTER TABLE member_data ADD COLUMN first_trial_date TEXT")
+        c.execute("ALTER TABLE member_data ADD COLUMN initial_plan TEXT")
 
     # Seed overrides if table is empty
     c.execute("SELECT COUNT(*) FROM store_overrides")
@@ -455,17 +474,28 @@ def get_revenue_months(year: int = None):
 # ─── Member Data ─────────────────────────────────────────────────────
 
 def save_member_data(records: list[dict]):
-    """Save member data from hacomono ML001. Replaces existing for same year/month."""
+    """Save member data from hacomono ML001 (v2). Replaces existing for same year/month/store."""
     if not records:
         return
     conn = get_connection()
     year = records[0]["year"]
     month = records[0]["month"]
-    conn.execute("DELETE FROM member_data WHERE year = ? AND month = ?", (year, month))
+    store_name = records[0].get("store_name", "")
+    # Delete by year/month/store so multi-store uploads don't clobber each other
+    conn.execute("DELETE FROM member_data WHERE year = ? AND month = ? AND store_name = ?", (year, month, store_name))
     for r in records:
         conn.execute(
-            """INSERT INTO member_data (year, month, store_name, member_id, member_name, plan_name, join_date, tenure)
-               VALUES (:year, :month, :store_name, :member_id, :member_name, :plan_name, :join_date, :tenure)""",
+            """INSERT INTO member_data (
+                year, month, store_name, member_id, member_name,
+                plan_name, join_date, tenure,
+                is_active, is_new, had_trial,
+                plan_end_date, trial_date, first_trial_date, initial_plan
+            ) VALUES (
+                :year, :month, :store_name, :member_id, :member_name,
+                :plan_name, :join_date, :tenure,
+                :is_active, :is_new, :had_trial,
+                :plan_end_date, :trial_date, :first_trial_date, :initial_plan
+            )""",
             r,
         )
     conn.commit()
@@ -501,6 +531,46 @@ def get_member_months(year: int = None):
         ).fetchall()
     conn.close()
     return [(r["year"], r["month"]) for r in rows]
+
+
+def get_member_summary_stats(year: int, month: int, store: str = None) -> dict:
+    """Compute summary stats from stored member records.
+
+    Returns dict with: total, active,休会, new, trial, plan_breakdown, churn
+    """
+    records = get_member_data(year, month, store)
+    if not records:
+        return {
+            "total": 0, "active": 0, "suspended": 0, "new": 0,
+            "trial": 0, "plan_breakdown": {}, "by_store": {},
+        }
+
+    import pandas as pd
+    df = pd.DataFrame(records)
+
+    total = len(df)
+    active = int(df["is_active"].sum())
+    suspended = total - active
+    new_count = int(df["is_new"].sum())
+    trial_count = int(df["had_trial"].sum())
+
+    plan_breakdown = df.groupby("plan_name").size().sort_values(ascending=False).to_dict()
+    by_store = df.groupby("store_name").size().to_dict()
+
+    # Active breakdown by plan
+    active_df = df[df["is_active"] == 1]
+    active_plan_breakdown = active_df.groupby("plan_name").size().sort_values(ascending=False).to_dict() if not active_df.empty else {}
+
+    return {
+        "total": total,
+        "active": active,
+        "suspended": suspended,
+        "new": new_count,
+        "trial": trial_count,
+        "plan_breakdown": plan_breakdown,
+        "active_plan_breakdown": active_plan_breakdown,
+        "by_store": by_store,
+    }
 
 
 # ─── Data availability ───────────────────────────────────────────────

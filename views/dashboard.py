@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from database import (
     get_payroll_data, get_expense_data, get_revenue_data, get_member_data,
-    get_available_years, get_available_months,
+    get_available_years, get_available_months, get_member_summary_stats,
     STORES, EXPENSE_CATEGORIES,
 )
 
@@ -106,16 +106,34 @@ def _compute_expense_summary(expense_records: list[dict]) -> dict:
 
 
 def _compute_member_summary(member_records: list[dict]) -> dict:
-    """Compute member aggregates from records."""
+    """Compute member aggregates from records (v2 — includes active/new/trial)."""
     if not member_records:
-        return {"total": 0, "by_store": {}, "by_plan": {}}
+        return {
+            "total": 0, "active": 0, "suspended": 0,
+            "new": 0, "trial": 0,
+            "by_store": {}, "by_plan": {}, "active_by_plan": {},
+        }
 
     df = pd.DataFrame(member_records)
     total = len(df)
     by_store = df.groupby("store_name").size().to_dict()
     by_plan = df.groupby("plan_name").size().sort_values(ascending=False).to_dict()
 
-    return {"total": total, "by_store": by_store, "by_plan": by_plan}
+    # v2 fields (graceful fallback if columns don't exist yet)
+    active = int(df["is_active"].sum()) if "is_active" in df.columns else total
+    suspended = total - active
+    new_count = int(df["is_new"].sum()) if "is_new" in df.columns else 0
+    trial_count = int(df["had_trial"].sum()) if "had_trial" in df.columns else 0
+
+    active_df = df[df["is_active"] == 1] if "is_active" in df.columns else df
+    active_by_plan = active_df.groupby("plan_name").size().sort_values(ascending=False).to_dict() if not active_df.empty else {}
+
+    return {
+        "total": total, "active": active, "suspended": suspended,
+        "new": new_count, "trial": trial_count,
+        "by_store": by_store, "by_plan": by_plan,
+        "active_by_plan": active_by_plan,
+    }
 
 
 def _compute_revenue_summary(revenue_records: list[dict]) -> dict:
@@ -285,15 +303,46 @@ def _render_monthly(year: int, month: int, store: str):
     if mem_sum["total"] > 0:
         st.markdown("---")
         st.subheader("会員情報")
-        st.metric("会員数", f"{mem_sum['total']}名")
+
+        # KPI cards for member data
+        mk1, mk2, mk3, mk4 = st.columns(4)
+        with mk1:
+            st.metric("全会員数", f"{mem_sum['total']}名")
+        with mk2:
+            st.metric("有効在籍数", f"{mem_sum['active']}名")
+        with mk3:
+            st.metric("新規入会（当月）", f"{mem_sum['new']}名")
+        with mk4:
+            st.metric("体験（当月）", f"{mem_sum['trial']}名")
+
+        if mem_sum["suspended"] > 0:
+            st.caption(f"休会: {mem_sum['suspended']}名")
+
+        # Estimate churn: check previous month data
+        prev_month = month - 1
+        prev_year = year
+        if prev_month < 1:
+            prev_month = 12
+            prev_year = year - 1
+        prev_members = get_member_data(prev_year, prev_month, store)
+        if prev_members:
+            prev_sum = _compute_member_summary(prev_members)
+            if prev_sum["total"] > 0:
+                estimated_churn = prev_sum["total"] - mem_sum["total"] + mem_sum["new"]
+                if estimated_churn > 0:
+                    st.caption(f"推定退会数（前月比）: {estimated_churn}名")
 
         mc1, mc2 = st.columns(2)
         with mc1:
-            st.markdown("**プラン別会員数**")
-            plan_df = pd.DataFrame(
-                [{"プラン名": k, "会員数": v} for k, v in mem_sum["by_plan"].items()]
-            )
-            st.dataframe(plan_df, use_container_width=True, hide_index=True)
+            st.markdown("**プラン別会員数（有効在籍）**")
+            if mem_sum["active_by_plan"]:
+                plan_data = sorted(mem_sum["active_by_plan"].items(), key=lambda x: -x[1])
+                plan_df = pd.DataFrame(plan_data, columns=["プラン名", "会員数"])
+                total_active = sum(v for _, v in plan_data)
+                plan_df["構成比"] = plan_df["会員数"].apply(
+                    lambda x: f"{x / total_active * 100:.1f}%" if total_active > 0 else "0%"
+                )
+                st.dataframe(plan_df, use_container_width=True, hide_index=True, key=f"plan_tbl_{year}_{month}_{store}")
 
         with mc2:
             if len(mem_sum["by_store"]) > 1:
@@ -301,16 +350,16 @@ def _render_monthly(year: int, month: int, store: str):
                 store_df = pd.DataFrame(
                     [{"店舗": k, "会員数": v} for k, v in sorted(mem_sum["by_store"].items(), key=lambda x: -x[1])]
                 )
-                st.dataframe(store_df, use_container_width=True, hide_index=True)
-            elif mem_sum["by_plan"]:
+                st.dataframe(store_df, use_container_width=True, hide_index=True, key=f"store_tbl_{year}_{month}_{store}")
+            elif mem_sum["active_by_plan"]:
                 # Single store — show plan pie chart
                 fig_plan = go.Figure(data=[go.Pie(
-                    labels=list(mem_sum["by_plan"].keys()),
-                    values=list(mem_sum["by_plan"].values()),
+                    labels=list(mem_sum["active_by_plan"].keys()),
+                    values=list(mem_sum["active_by_plan"].values()),
                     hole=0.4,
                 )])
                 fig_plan.update_layout(
-                    title="プラン構成比", height=350,
+                    title="プラン構成比（有効在籍）", height=350,
                     margin=dict(l=20, r=20, t=40, b=20),
                 )
                 st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_pie_{year}_{month}_{store}")
@@ -347,8 +396,13 @@ def _render_annual(year: int, store: str):
             "legal_welfare": pay_sum["legal_welfare"],
             "member_count": rev_sum["member_count"],
             "member_count_ml": mem_sum["total"],
+            "member_active_ml": mem_sum.get("active", 0),
+            "member_new_ml": mem_sum.get("new", 0),
+            "member_trial_ml": mem_sum.get("trial", 0),
+            "member_suspended_ml": mem_sum.get("suspended", 0),
             "member_by_store": mem_sum["by_store"],
             "member_by_plan": mem_sum["by_plan"],
+            "member_active_by_plan": mem_sum.get("active_by_plan", {}),
             "employee_count": pay_sum["employee_count"],
             "fulltime_count": pay_sum["fulltime_count"],
             "parttime_count": pay_sum["parttime_count"],
@@ -480,39 +534,62 @@ def _render_annual(year: int, store: str):
         st.markdown("---")
         st.subheader("会員データ (hacomono)")
 
+        # Find latest month with data for snapshot
+        latest_member_month = None
+        for row in reversed(monthly_data):
+            if row["member_count_ml"] > 0:
+                latest_member_month = row
+                break
+
+        # KPI row for latest month
+        if latest_member_month:
+            mk1, mk2, mk3, mk4 = st.columns(4)
+            with mk1:
+                st.metric("全会員数", f"{latest_member_month['member_count_ml']}名",
+                          help=f"{latest_member_month['month_label']}時点")
+            with mk2:
+                st.metric("有効在籍数", f"{latest_member_month['member_active_ml']}名")
+            with mk3:
+                st.metric("新規入会", f"{latest_member_month['member_new_ml']}名")
+            with mk4:
+                st.metric("体験", f"{latest_member_month['member_trial_ml']}名")
+
         mc1, mc2 = st.columns(2)
 
         with mc1:
-            # Member count by store (bar chart) — use latest month with data
-            latest_member_month = None
-            for row in reversed(monthly_data):
-                if row["member_count_ml"] > 0:
-                    latest_member_month = row
-                    break
+            # Member count trend (line chart)
+            ml_months = [row["month_label"] for row in monthly_data if row["member_count_ml"] > 0]
+            ml_total = [row["member_count_ml"] for row in monthly_data if row["member_count_ml"] > 0]
+            ml_active = [row["member_active_ml"] for row in monthly_data if row["member_count_ml"] > 0]
 
-            if latest_member_month and latest_member_month["member_by_store"]:
-                by_store = latest_member_month["member_by_store"]
-                fig_mem_store = go.Figure()
-                stores_sorted = sorted(by_store.items(), key=lambda x: -x[1])
-                fig_mem_store.add_trace(go.Bar(
-                    x=[s[0] for s in stores_sorted],
-                    y=[s[1] for s in stores_sorted],
-                    marker_color="#2196F3",
-                    text=[s[1] for s in stores_sorted],
-                    textposition="auto",
+            if ml_months:
+                fig_ml_trend = go.Figure()
+                fig_ml_trend.add_trace(go.Scatter(
+                    x=ml_months, y=ml_total,
+                    mode="lines+markers", name="全会員数",
+                    line=dict(color="#2196F3", width=3),
+                    marker=dict(size=8),
                 ))
-                fig_mem_store.update_layout(
-                    title=f"店舗別会員数（{latest_member_month['month_label']}）",
-                    xaxis_title="店舗", yaxis_title="会員数",
+                fig_ml_trend.add_trace(go.Scatter(
+                    x=ml_months, y=ml_active,
+                    mode="lines+markers", name="有効在籍数",
+                    line=dict(color="#4CAF50", width=3),
+                    marker=dict(size=8),
+                ))
+                fig_ml_trend.update_layout(
+                    title="会員数推移", xaxis_title="月", yaxis_title="会員数",
                     height=380, margin=dict(l=20, r=20, t=40, b=20),
                 )
-                st.plotly_chart(fig_mem_store, use_container_width=True, key=f"chart_mem_store_{year}_{store}")
+                st.plotly_chart(fig_ml_trend, use_container_width=True, key=f"chart_ml_trend_{year}_{store}")
 
         with mc2:
             # Plan breakdown (horizontal bar) — use latest month with data
-            if latest_member_month and latest_member_month["member_by_plan"]:
-                by_plan = latest_member_month["member_by_plan"]
-                plans_sorted = sorted(by_plan.items(), key=lambda x: x[1])
+            plan_data = latest_member_month.get("member_active_by_plan", {}) if latest_member_month else {}
+            if not plan_data:
+                plan_data = latest_member_month.get("member_by_plan", {}) if latest_member_month else {}
+
+            if plan_data:
+                plans_sorted = sorted(plan_data.items(), key=lambda x: x[1])
                 fig_plan = go.Figure()
                 fig_plan.add_trace(go.Bar(
                     y=[p[0] for p in plans_sorted],
@@ -529,22 +606,58 @@ def _render_annual(year: int, store: str):
                 )
                 st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_bar_{year}_{store}")
 
-        # Member count trend (ML001-based)
-        ml_months = [row["month_label"] for row in monthly_data if row["member_count_ml"] > 0]
-        ml_counts = [row["member_count_ml"] for row in monthly_data if row["member_count_ml"] > 0]
-        if len(ml_months) > 1:
-            fig_ml_trend = go.Figure()
-            fig_ml_trend.add_trace(go.Scatter(
-                x=ml_months, y=ml_counts,
-                mode="lines+markers", name="会員数（ML001）",
-                line=dict(color="#FF9800", width=3),
-                marker=dict(size=8),
-            ))
-            fig_ml_trend.update_layout(
-                title="会員数推移（ML001）", xaxis_title="月", yaxis_title="会員数",
-                height=350, margin=dict(l=20, r=20, t=40, b=20),
-            )
-            st.plotly_chart(fig_ml_trend, use_container_width=True, key=f"chart_ml_trend_{year}_{store}")
+        # New member trend by month (bar chart)
+        ml_new_months = [row["month_label"] for row in monthly_data if row["member_count_ml"] > 0]
+        ml_new_counts = [row["member_new_ml"] for row in monthly_data if row["member_count_ml"] > 0]
+        ml_trial_counts = [row["member_trial_ml"] for row in monthly_data if row["member_count_ml"] > 0]
+
+        if ml_new_months and any(c > 0 for c in ml_new_counts + ml_trial_counts):
+            mc3, mc4 = st.columns(2)
+
+            with mc3:
+                fig_new = go.Figure()
+                fig_new.add_trace(go.Bar(
+                    x=ml_new_months, y=ml_new_counts,
+                    name="新規入会", marker_color="#FF9800",
+                    text=ml_new_counts, textposition="auto",
+                ))
+                fig_new.update_layout(
+                    title="新規入会数推移", xaxis_title="月", yaxis_title="人数",
+                    height=350, margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_new, use_container_width=True, key=f"chart_new_trend_{year}_{store}")
+
+            with mc4:
+                # Store breakdown (bar) — only for 全体 view
+                if store == "全体" and latest_member_month and latest_member_month["member_by_store"]:
+                    by_store = latest_member_month["member_by_store"]
+                    stores_sorted = sorted(by_store.items(), key=lambda x: -x[1])
+                    fig_mem_store = go.Figure()
+                    fig_mem_store.add_trace(go.Bar(
+                        x=[s[0] for s in stores_sorted],
+                        y=[s[1] for s in stores_sorted],
+                        marker_color="#2196F3",
+                        text=[s[1] for s in stores_sorted],
+                        textposition="auto",
+                    ))
+                    fig_mem_store.update_layout(
+                        title=f"店舗別会員数（{latest_member_month['month_label']}）",
+                        xaxis_title="店舗", yaxis_title="会員数",
+                        height=350, margin=dict(l=20, r=20, t=40, b=20),
+                    )
+                    st.plotly_chart(fig_mem_store, use_container_width=True, key=f"chart_mem_store_{year}_{store}")
+                else:
+                    fig_trial = go.Figure()
+                    fig_trial.add_trace(go.Bar(
+                        x=ml_new_months, y=ml_trial_counts,
+                        name="体験", marker_color="#9C27B0",
+                        text=ml_trial_counts, textposition="auto",
+                    ))
+                    fig_trial.update_layout(
+                        title="体験数推移", xaxis_title="月", yaxis_title="人数",
+                        height=350, margin=dict(l=20, r=20, t=40, b=20),
+                    )
+                    st.plotly_chart(fig_trial, use_container_width=True, key=f"chart_trial_trend_{year}_{store}")
 
     # Annual cumulative PL table
     st.markdown("---")

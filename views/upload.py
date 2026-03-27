@@ -6,6 +6,7 @@ import openpyxl
 import io
 import csv
 import re
+from datetime import datetime, date
 from database import (
     save_payroll_data, save_expense_data, save_revenue_data,
     save_member_data,
@@ -36,6 +37,233 @@ def _map_hacomono_store(full_name: str) -> str:
     # Fallback: strip prefix/suffix
     short = full_name.replace("ハイアルチ", "").replace("スタジオ", "").strip()
     return short if short else full_name
+
+
+def _parse_date_loose(val: str) -> date | None:
+    """Parse a date string in various formats. Returns None if unparseable or empty."""
+    if not val or not val.strip():
+        return None
+    val = val.strip()
+    for fmt in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(val, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _is_in_month(dt: date | None, year: int, month: int) -> bool:
+    """Check if a date falls within the given year/month."""
+    if dt is None:
+        return False
+    return dt.year == year and dt.month == month
+
+
+def _parse_ml001_csv(
+    file_bytes: bytes, year: int, month: int, target_store: str
+) -> tuple[list[dict], dict]:
+    """Parse hacomono ML001 member CSV.
+
+    Returns (records, summary_info).
+    CSV is UTF-8-sig with 58 columns. Uses 0-indexed column positions as fallback.
+    """
+    # Decode
+    text = None
+    for enc in ["utf-8-sig", "utf-8", "cp932"]:
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError("CSVのエンコーディングを判定できませんでした")
+
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader)
+
+    # Build column index map (header name → index)
+    hmap = {}
+    for i, h in enumerate(header):
+        hmap[h.strip()] = i
+
+    # Key column indices — try header name first, fall back to known positions
+    def _col(name: str, fallback: int) -> int:
+        return hmap.get(name, fallback)
+
+    idx_member_id = _col("メンバーID", 0)
+    idx_member_name = _col("氏名", 2)
+    idx_trial_date = _col("無料体験会 受講日時", 37)
+    idx_first_trial = _col("トライアル 初回受講日時", 38)
+    idx_join_date = _col("入会日時", 39)
+    idx_member_store = _col("メンバー所属店舗名", 44)
+    idx_plan_name = _col("契約プラン名", 47)
+    idx_current_store = _col("所属店舗名", 49)
+    idx_plan_contract_date = _col("プラン契約日", 50)
+    idx_plan_end_date = _col("プラン契約適用終了日", 52)
+    idx_initial_plan = _col("初回契約プラン", 55)
+    idx_tenure = _col("在籍期間", 56)
+
+    today = date.today()
+    records = []
+    empty_store_count = 0
+    total_count = 0
+    active_count = 0
+    suspended_count = 0
+    new_count = 0
+    trial_count = 0
+    plan_counts = {}
+    active_plan_counts = {}
+    personal_ticket_count = 0
+
+    for row in reader:
+        if len(row) < 10:
+            continue
+
+        # Extract fields safely
+        def _get(idx: int) -> str:
+            return row[idx].strip() if idx < len(row) else ""
+
+        member_id = _get(idx_member_id)
+        member_name = _get(idx_member_name)
+        plan_name = _get(idx_plan_name)
+
+        # Skip rows with no plan name (empty rows)
+        if not plan_name:
+            continue
+
+        # Determine store
+        store_full = _get(idx_current_store)
+        if not store_full:
+            store_full = _get(idx_member_store)
+
+        if store_full:
+            store_short = _map_hacomono_store(store_full)
+        else:
+            # Empty store name — assign to target store (they belong to this store's export)
+            store_short = target_store
+            empty_store_count += 1
+
+        total_count += 1
+
+        # Parse dates
+        trial_dt = _parse_date_loose(_get(idx_trial_date))
+        first_trial_dt = _parse_date_loose(_get(idx_first_trial))
+        join_dt = _parse_date_loose(_get(idx_join_date))
+        plan_contract_dt = _parse_date_loose(_get(idx_plan_contract_date))
+        plan_end_dt = _parse_date_loose(_get(idx_plan_end_date))
+
+        tenure = _get(idx_tenure)
+        initial_plan = _get(idx_initial_plan)
+        join_date_str = _get(idx_join_date)
+        trial_date_str = _get(idx_trial_date)
+        first_trial_str = _get(idx_first_trial)
+        plan_end_str = _get(idx_plan_end_date)
+
+        # Determine is_active: active unless 休会 in plan name, or plan_end_date is in the past
+        is_suspended = "休会" in plan_name
+        has_ended = plan_end_dt is not None and plan_end_dt < today
+        is_active = 0 if (is_suspended or has_ended) else 1
+
+        # Determine is_new: tenure is "1ヶ月目" OR plan_contract_date is in the selected month
+        is_new = 0
+        if tenure == "1ヶ月目":
+            is_new = 1
+        elif _is_in_month(plan_contract_dt, year, month):
+            is_new = 1
+
+        # Determine had_trial: trial date or first trial date falls within selected month
+        had_trial = 0
+        if _is_in_month(trial_dt, year, month) or _is_in_month(first_trial_dt, year, month):
+            had_trial = 1
+
+        # Track パーソナルチケット
+        if "パーソナル" in plan_name and "チケット" in plan_name:
+            personal_ticket_count += 1
+
+        records.append({
+            "year": year,
+            "month": month,
+            "store_name": store_short,
+            "member_id": member_id,
+            "member_name": member_name,
+            "plan_name": plan_name,
+            "join_date": join_date_str,
+            "tenure": tenure,
+            "is_active": is_active,
+            "is_new": is_new,
+            "had_trial": had_trial,
+            "plan_end_date": plan_end_str,
+            "trial_date": trial_date_str,
+            "first_trial_date": first_trial_str,
+            "initial_plan": initial_plan,
+        })
+
+        plan_counts[plan_name] = plan_counts.get(plan_name, 0) + 1
+        if is_active:
+            active_count += 1
+            active_plan_counts[plan_name] = active_plan_counts.get(plan_name, 0) + 1
+        if is_suspended:
+            suspended_count += 1
+        if is_new:
+            new_count += 1
+        if had_trial:
+            trial_count += 1
+
+    summary_info = {
+        "total": total_count,
+        "active": active_count,
+        "suspended": suspended_count,
+        "new": new_count,
+        "trial": trial_count,
+        "plan_counts": plan_counts,
+        "active_plan_counts": active_plan_counts,
+        "empty_store_count": empty_store_count,
+        "personal_ticket": personal_ticket_count,
+        "store": target_store,
+    }
+
+    return records, summary_info
+
+
+def _render_ml001_summary(info: dict):
+    """Render summary after ML001 import."""
+    st.markdown("---")
+    st.markdown("### 取込結果サマリー")
+
+    # KPI row
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        st.metric("全会員数", f"{info['total']}名")
+    with k2:
+        st.metric("有効在籍数", f"{info['active']}名")
+    with k3:
+        st.metric("休会", f"{info['suspended']}名")
+    with k4:
+        st.metric("新規入会（当月）", f"{info['new']}名")
+    with k5:
+        st.metric("体験（当月）", f"{info['trial']}名")
+
+    # Plan breakdown table
+    st.markdown("---")
+    col_plan, col_active_plan = st.columns(2)
+
+    with col_plan:
+        st.markdown("**プラン別 全会員数**")
+        if info["plan_counts"]:
+            plan_data = sorted(info["plan_counts"].items(), key=lambda x: -x[1])
+            plan_df = pd.DataFrame(plan_data, columns=["プラン名", "会員数"])
+            total = sum(v for _, v in plan_data)
+            plan_df["構成比"] = plan_df["会員数"].apply(lambda x: f"{x / total * 100:.1f}%")
+            st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
+    with col_active_plan:
+        st.markdown("**プラン別 有効在籍数**")
+        if info["active_plan_counts"]:
+            active_data = sorted(info["active_plan_counts"].items(), key=lambda x: -x[1])
+            active_df = pd.DataFrame(active_data, columns=["プラン名", "会員数"])
+            active_total = sum(v for _, v in active_data)
+            active_df["構成比"] = active_df["会員数"].apply(lambda x: f"{x / active_total * 100:.1f}%")
+            st.dataframe(active_df, use_container_width=True, hide_index=True)
 
 
 def _safe_float(val) -> float:
@@ -522,13 +750,15 @@ def render():
         # ─── 会員データ (ML001) ────────────────────────────
         with sub_member:
             st.markdown("#### 会員データ取込 (ML001)")
-            st.caption("hacomono「メンバー一覧」クエリ ML001 の CSV をアップロード")
+            st.caption("hacomono「メンバー一覧」クエリ ML001 の CSV をアップロード（UTF-8-sig, 58列）")
 
-            col_ym1, col_ym2 = st.columns(2)
+            col_ym1, col_ym2, col_store_ml = st.columns(3)
             with col_ym1:
                 ml_year = st.number_input("対象年", min_value=2020, max_value=2030, value=2026, key="ml_year")
             with col_ym2:
                 ml_month = st.number_input("対象月", min_value=1, max_value=12, value=3, key="ml_month")
+            with col_store_ml:
+                ml_store = st.selectbox("対象店舗", STORES, key="ml_store")
 
             uploaded_ml = st.file_uploader(
                 "ML001 CSVをアップロード",
@@ -537,115 +767,36 @@ def render():
             )
 
             if uploaded_ml is not None:
-                st.info(f"📄 **{uploaded_ml.name}**")
+                st.info(f"📄 **{uploaded_ml.name}** → **{ml_store}** / {ml_year}年{ml_month}月")
 
             if st.button("▶ 会員データを取り込む", type="primary", key="btn_ml001"):
                 if uploaded_ml is not None:
                     file_bytes = uploaded_ml.read()
                     try:
-                        # Try encodings
-                        text = None
-                        for enc in ["utf-8-sig", "utf-8", "cp932"]:
-                            try:
-                                text = file_bytes.decode(enc)
-                                break
-                            except UnicodeDecodeError:
-                                continue
-                        if text is None:
-                            raise ValueError("CSVのエンコーディングを判定できませんでした")
-
-                        reader = csv.reader(io.StringIO(text))
-                        header = next(reader)
-
-                        # Find column indices by header name
-                        col_idx = {}
-                        target_cols = {
-                            "メンバーID": "member_id",
-                            "氏名": "member_name",
-                            "契約プラン名": "plan_name",
-                            "所属店舗名": "store_name_full",
-                            "メンバー所属店舗名": "member_store_name_full",
-                            "プラン契約日": "join_date",
-                            "入会日時": "join_datetime",
-                            "在籍期間": "tenure",
-                        }
-                        for i, h in enumerate(header):
-                            h_stripped = h.strip()
-                            if h_stripped in target_cols:
-                                col_idx[target_cols[h_stripped]] = i
-
-                        records = []
-                        plan_counts = {}
-                        store_counts = {}
-                        skipped = 0
-
-                        for row in reader:
-                            if len(row) < 10:
-                                continue
-
-                            member_id = row[col_idx.get("member_id", 0)].strip() if "member_id" in col_idx else ""
-                            member_name = row[col_idx.get("member_name", 2)].strip() if "member_name" in col_idx else ""
-                            plan_name = row[col_idx.get("plan_name", 47)].strip() if "plan_name" in col_idx else ""
-
-                            # Determine store: prefer 所属店舗名 (plan-level), fallback to メンバー所属店舗名
-                            store_full = ""
-                            if "store_name_full" in col_idx:
-                                store_full = row[col_idx["store_name_full"]].strip()
-                            if not store_full and "member_store_name_full" in col_idx:
-                                store_full = row[col_idx["member_store_name_full"]].strip()
-
-                            if not store_full:
-                                skipped += 1
-                                continue
-
-                            store_short = _map_hacomono_store(store_full)
-
-                            join_date = ""
-                            if "join_date" in col_idx:
-                                join_date = row[col_idx["join_date"]].strip()
-                            elif "join_datetime" in col_idx:
-                                join_date = row[col_idx["join_datetime"]].strip()
-
-                            tenure = row[col_idx.get("tenure", 56)].strip() if "tenure" in col_idx else ""
-
-                            records.append({
-                                "year": ml_year,
-                                "month": ml_month,
-                                "store_name": store_short,
-                                "member_id": member_id,
-                                "member_name": member_name,
-                                "plan_name": plan_name,
-                                "join_date": join_date,
-                                "tenure": tenure,
-                            })
-
-                            plan_counts[plan_name] = plan_counts.get(plan_name, 0) + 1
-                            store_counts[store_short] = store_counts.get(store_short, 0) + 1
+                        records, summary_info = _parse_ml001_csv(
+                            file_bytes, ml_year, ml_month, ml_store
+                        )
 
                         if records:
                             save_member_data(records)
-                            st.success(f"✅ {ml_year}年{ml_month}月の会員データを取り込みました（{len(records)}名）")
-                            if skipped > 0:
-                                st.warning(f"⚠️ 店舗名が空の {skipped} 件はスキップしました")
-
-                            # Summary: store breakdown
-                            st.markdown("**店舗別会員数:**")
-                            store_df = pd.DataFrame(
-                                [{"店舗": k, "会員数": v} for k, v in sorted(store_counts.items(), key=lambda x: -x[1])]
+                            st.success(
+                                f"✅ {ml_year}年{ml_month}月 **{ml_store}** の会員データを取り込みました"
+                                f"（{summary_info['total']}名）"
                             )
-                            st.dataframe(store_df, use_container_width=True, hide_index=True)
+                            if summary_info.get("empty_store_count", 0) > 0:
+                                st.info(
+                                    f"ℹ️ 店舗名が空の会員 {summary_info['empty_store_count']} 名も含めて取り込みました"
+                                )
 
-                            # Summary: plan breakdown
-                            st.markdown("**プラン別会員数:**")
-                            plan_df = pd.DataFrame(
-                                [{"プラン名": k, "会員数": v} for k, v in sorted(plan_counts.items(), key=lambda x: -x[1])]
-                            )
-                            st.dataframe(plan_df, use_container_width=True, hide_index=True)
+                            # Display summary
+                            _render_ml001_summary(summary_info)
                         else:
                             st.warning("データが見つかりませんでした。ファイルの形式を確認してください。")
 
                     except Exception as e:
                         st.error(f"ファイルの読み込みに失敗しました: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
                 else:
                     st.warning("CSVファイルをアップロードしてください。")
 
