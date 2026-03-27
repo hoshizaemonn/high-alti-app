@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from database import (
-    get_payroll_data, get_expense_data, get_revenue_data,
+    get_payroll_data, get_expense_data, get_revenue_data, get_member_data,
     get_available_years, get_available_months,
     STORES, EXPENSE_CATEGORIES,
 )
@@ -103,6 +103,19 @@ def _compute_expense_summary(expense_records: list[dict]) -> dict:
         "by_category": by_cat,
         "revenue_items": revenue_df["deposit"].sum(),
     }
+
+
+def _compute_member_summary(member_records: list[dict]) -> dict:
+    """Compute member aggregates from records."""
+    if not member_records:
+        return {"total": 0, "by_store": {}, "by_plan": {}}
+
+    df = pd.DataFrame(member_records)
+    total = len(df)
+    by_store = df.groupby("store_name").size().to_dict()
+    by_plan = df.groupby("plan_name").size().sort_values(ascending=False).to_dict()
+
+    return {"total": total, "by_store": by_store, "by_plan": by_plan}
 
 
 def _compute_revenue_summary(revenue_records: list[dict]) -> dict:
@@ -265,6 +278,43 @@ def _render_monthly(year: int, month: int, store: str):
         df_exp_display["勘定科目"] = df_exp_display["勘定科目"].fillna("未分類")
         st.dataframe(df_exp_display, use_container_width=True, hide_index=True)
 
+    # Member data
+    members = get_member_data(year, month, store)
+    mem_sum = _compute_member_summary(members)
+
+    if mem_sum["total"] > 0:
+        st.markdown("---")
+        st.subheader("会員情報")
+        st.metric("会員数", f"{mem_sum['total']}名")
+
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            st.markdown("**プラン別会員数**")
+            plan_df = pd.DataFrame(
+                [{"プラン名": k, "会員数": v} for k, v in mem_sum["by_plan"].items()]
+            )
+            st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
+        with mc2:
+            if len(mem_sum["by_store"]) > 1:
+                st.markdown("**店舗別会員数**")
+                store_df = pd.DataFrame(
+                    [{"店舗": k, "会員数": v} for k, v in sorted(mem_sum["by_store"].items(), key=lambda x: -x[1])]
+                )
+                st.dataframe(store_df, use_container_width=True, hide_index=True)
+            elif mem_sum["by_plan"]:
+                # Single store — show plan pie chart
+                fig_plan = go.Figure(data=[go.Pie(
+                    labels=list(mem_sum["by_plan"].keys()),
+                    values=list(mem_sum["by_plan"].values()),
+                    hole=0.4,
+                )])
+                fig_plan.update_layout(
+                    title="プラン構成比", height=350,
+                    margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_pie_{year}_{month}_{store}")
+
 
 def _render_annual(year: int, store: str):
     """Render annual PL view with charts."""
@@ -275,10 +325,12 @@ def _render_annual(year: int, store: str):
         payroll = get_payroll_data(year, m, store)
         expenses = get_expense_data(year, m, store)
         revenue = get_revenue_data(year, m, store)
+        members = get_member_data(year, m, store)
 
         pay_sum = _compute_payroll_summary(payroll)
         exp_sum = _compute_expense_summary(expenses)
         rev_sum = _compute_revenue_summary(revenue)
+        mem_sum = _compute_member_summary(members)
 
         total_labor = pay_sum["total_labor_cost"]
         total_expense = exp_sum["total"]
@@ -294,6 +346,9 @@ def _render_annual(year: int, store: str):
             "gross_total": pay_sum["gross_total"],
             "legal_welfare": pay_sum["legal_welfare"],
             "member_count": rev_sum["member_count"],
+            "member_count_ml": mem_sum["total"],
+            "member_by_store": mem_sum["by_store"],
+            "member_by_plan": mem_sum["by_plan"],
             "employee_count": pay_sum["employee_count"],
             "fulltime_count": pay_sum["fulltime_count"],
             "parttime_count": pay_sum["parttime_count"],
@@ -418,6 +473,78 @@ def _render_annual(year: int, store: str):
                     margin=dict(l=20, r=20, t=40, b=20),
                 )
                 st.plotly_chart(fig_pie, use_container_width=True, key=f"chart_pie_{year}_{store}")
+
+    # Member data charts (from ML001)
+    has_member_data = any(row["member_count_ml"] > 0 for row in monthly_data)
+    if has_member_data:
+        st.markdown("---")
+        st.subheader("会員データ (hacomono)")
+
+        mc1, mc2 = st.columns(2)
+
+        with mc1:
+            # Member count by store (bar chart) — use latest month with data
+            latest_member_month = None
+            for row in reversed(monthly_data):
+                if row["member_count_ml"] > 0:
+                    latest_member_month = row
+                    break
+
+            if latest_member_month and latest_member_month["member_by_store"]:
+                by_store = latest_member_month["member_by_store"]
+                fig_mem_store = go.Figure()
+                stores_sorted = sorted(by_store.items(), key=lambda x: -x[1])
+                fig_mem_store.add_trace(go.Bar(
+                    x=[s[0] for s in stores_sorted],
+                    y=[s[1] for s in stores_sorted],
+                    marker_color="#2196F3",
+                    text=[s[1] for s in stores_sorted],
+                    textposition="auto",
+                ))
+                fig_mem_store.update_layout(
+                    title=f"店舗別会員数（{latest_member_month['month_label']}）",
+                    xaxis_title="店舗", yaxis_title="会員数",
+                    height=380, margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_mem_store, use_container_width=True, key=f"chart_mem_store_{year}_{store}")
+
+        with mc2:
+            # Plan breakdown (horizontal bar) — use latest month with data
+            if latest_member_month and latest_member_month["member_by_plan"]:
+                by_plan = latest_member_month["member_by_plan"]
+                plans_sorted = sorted(by_plan.items(), key=lambda x: x[1])
+                fig_plan = go.Figure()
+                fig_plan.add_trace(go.Bar(
+                    y=[p[0] for p in plans_sorted],
+                    x=[p[1] for p in plans_sorted],
+                    orientation="h",
+                    marker_color="#4CAF50",
+                    text=[p[1] for p in plans_sorted],
+                    textposition="auto",
+                ))
+                fig_plan.update_layout(
+                    title=f"プラン別会員数（{latest_member_month['month_label']}）",
+                    xaxis_title="会員数", yaxis_title="",
+                    height=380, margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_bar_{year}_{store}")
+
+        # Member count trend (ML001-based)
+        ml_months = [row["month_label"] for row in monthly_data if row["member_count_ml"] > 0]
+        ml_counts = [row["member_count_ml"] for row in monthly_data if row["member_count_ml"] > 0]
+        if len(ml_months) > 1:
+            fig_ml_trend = go.Figure()
+            fig_ml_trend.add_trace(go.Scatter(
+                x=ml_months, y=ml_counts,
+                mode="lines+markers", name="会員数（ML001）",
+                line=dict(color="#FF9800", width=3),
+                marker=dict(size=8),
+            ))
+            fig_ml_trend.update_layout(
+                title="会員数推移（ML001）", xaxis_title="月", yaxis_title="会員数",
+                height=350, margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(fig_ml_trend, use_container_width=True, key=f"chart_ml_trend_{year}_{store}")
 
     # Annual cumulative PL table
     st.markdown("---")

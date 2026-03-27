@@ -1,4 +1,4 @@
-"""Data upload page — handles payroll (Excel/CSV) and expense (CSV)."""
+"""Data upload page — handles payroll (Excel/CSV), expense (CSV), and hacomono data."""
 
 import streamlit as st
 import pandas as pd
@@ -8,10 +8,34 @@ import csv
 import re
 from database import (
     save_payroll_data, save_expense_data, save_revenue_data,
+    save_member_data,
     upsert_override, STORES, EXPENSE_CATEGORIES,
 )
 from store_logic import resolve_store, apply_ratio
 from expense_logic import classify_expense
+
+
+# hacomono store name mapping: full name → short name used in the app
+HACOMONO_STORE_MAP = {
+    "ハイアルチ東日本橋スタジオ": "東日本橋",
+    "ハイアルチ春日スタジオ": "春日",
+    "ハイアルチ船橋スタジオ": "船橋",
+    "ハイアルチ巣鴨スタジオ": "巣鴨",
+    "ハイアルチ祖師ヶ谷大蔵スタジオ": "祖師ヶ谷大蔵",
+    "ハイアルチ下北沢スタジオ": "下北沢",
+    "ハイアルチ中目黒スタジオ": "中目黒",
+    "ハイアルチ東陽町スタジオ": "東陽町",
+}
+
+
+def _map_hacomono_store(full_name: str) -> str:
+    """Map hacomono full store name to short name."""
+    full_name = full_name.strip()
+    if full_name in HACOMONO_STORE_MAP:
+        return HACOMONO_STORE_MAP[full_name]
+    # Fallback: strip prefix/suffix
+    short = full_name.replace("ハイアルチ", "").replace("スタジオ", "").strip()
+    return short if short else full_name
 
 
 def _safe_float(val) -> float:
@@ -488,75 +512,247 @@ def render():
                     del st.session_state["expense_records"]
                     del st.session_state["expense_meta"]
 
-    # ─── 売上 Upload ──────────────────────────────────────────
+    # ─── 売上・会員 Upload (hacomono) ─────────────────────────
     with tab_revenue:
-        st.subheader("売上・会員データ取込")
-        st.caption("hacomonoから出力した売上・会員CSV（Shift-JIS / UTF-8）をアップロード")
+        st.subheader("hacomonoデータ取込")
+        st.caption("hacomonoから出力したCSVをアップロード（会員リスト ML001 / 売上集計 PA002）")
 
-        col_store_r, col_year_r, col_month_r = st.columns(3)
-        with col_store_r:
-            rev_store = st.selectbox("対象店舗", STORES, key="rev_store")
-        with col_year_r:
-            rev_year = st.number_input("対象年", min_value=2020, max_value=2030, value=2026, key="rev_year")
-        with col_month_r:
-            rev_month = st.number_input("対象月", min_value=1, max_value=12, value=2, key="rev_month")
+        sub_member, sub_sales = st.tabs(["👥 会員データ (ML001)", "💰 売上データ (PA002)"])
 
-        uploaded_revenue = st.file_uploader(
-            "CSVファイルをアップロード",
-            type=["csv", "xlsx", "xls"],
-            key="revenue_upload",
-        )
+        # ─── 会員データ (ML001) ────────────────────────────
+        with sub_member:
+            st.markdown("#### 会員データ取込 (ML001)")
+            st.caption("hacomono「メンバー一覧」クエリ ML001 の CSV をアップロード")
 
-        if uploaded_revenue is not None:
-            st.info(f"📄 **{uploaded_revenue.name}** → **{rev_store}** / {rev_year}年{rev_month}月")
+            col_ym1, col_ym2 = st.columns(2)
+            with col_ym1:
+                ml_year = st.number_input("対象年", min_value=2020, max_value=2030, value=2026, key="ml_year")
+            with col_ym2:
+                ml_month = st.number_input("対象月", min_value=1, max_value=12, value=3, key="ml_month")
 
-        if st.button("▶ 売上データを取り込む", type="primary", key="btn_revenue"):
-            if uploaded_revenue is not None:
-                file_bytes = uploaded_revenue.read()
-                filename = uploaded_revenue.name
+            uploaded_ml = st.file_uploader(
+                "ML001 CSVをアップロード",
+                type=["csv"],
+                key="ml001_upload",
+            )
 
-                try:
-                    if filename.endswith(".csv"):
-                        for enc in ["cp932", "utf-8", "utf-8-sig"]:
+            if uploaded_ml is not None:
+                st.info(f"📄 **{uploaded_ml.name}**")
+
+            if st.button("▶ 会員データを取り込む", type="primary", key="btn_ml001"):
+                if uploaded_ml is not None:
+                    file_bytes = uploaded_ml.read()
+                    try:
+                        # Try encodings
+                        text = None
+                        for enc in ["utf-8-sig", "utf-8", "cp932"]:
                             try:
-                                df_rev = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
+                                text = file_bytes.decode(enc)
                                 break
                             except UnicodeDecodeError:
                                 continue
-                    else:
-                        df_rev = pd.read_excel(io.BytesIO(file_bytes))
+                        if text is None:
+                            raise ValueError("CSVのエンコーディングを判定できませんでした")
 
-                    st.success(f"✅ ファイル読み込み完了（{len(df_rev)}行 × {len(df_rev.columns)}列）")
-                    st.dataframe(df_rev.head(20), use_container_width=True, hide_index=True)
+                        reader = csv.reader(io.StringIO(text))
+                        header = next(reader)
 
-                    # Try to detect amount and member columns
-                    total_amount = 0
-                    member_count = 0
+                        # Find column indices by header name
+                        col_idx = {}
+                        target_cols = {
+                            "メンバーID": "member_id",
+                            "氏名": "member_name",
+                            "契約プラン名": "plan_name",
+                            "所属店舗名": "store_name_full",
+                            "メンバー所属店舗名": "member_store_name_full",
+                            "プラン契約日": "join_date",
+                            "入会日時": "join_datetime",
+                            "在籍期間": "tenure",
+                        }
+                        for i, h in enumerate(header):
+                            h_stripped = h.strip()
+                            if h_stripped in target_cols:
+                                col_idx[target_cols[h_stripped]] = i
 
-                    # Sum numeric columns that look like amounts
-                    for col in df_rev.columns:
-                        col_lower = str(col).lower()
-                        if any(k in col_lower for k in ["売上", "金額", "amount", "収入", "合計"]):
-                            total_amount += pd.to_numeric(df_rev[col], errors="coerce").fillna(0).sum()
-                        if any(k in col_lower for k in ["会員", "member", "人数", "在籍"]):
-                            member_count += int(pd.to_numeric(df_rev[col], errors="coerce").fillna(0).sum())
+                        records = []
+                        plan_counts = {}
+                        store_counts = {}
+                        skipped = 0
 
-                    if total_amount > 0 or member_count > 0:
-                        st.info(f"検出: 売上合計 **¥{total_amount:,.0f}** / 会員数 **{member_count}名**")
+                        for row in reader:
+                            if len(row) < 10:
+                                continue
 
-                    rev_records = [{
-                        "year": rev_year,
-                        "month": rev_month,
-                        "store_name": rev_store,
-                        "category": "売上",
-                        "amount": float(total_amount),
-                        "member_count": member_count,
-                        "note": f"ファイル: {filename}",
-                    }]
-                    save_revenue_data(rev_records)
-                    st.success(f"✅ **{rev_store}** {rev_year}年{rev_month}月の売上データを保存しました")
+                            member_id = row[col_idx.get("member_id", 0)].strip() if "member_id" in col_idx else ""
+                            member_name = row[col_idx.get("member_name", 2)].strip() if "member_name" in col_idx else ""
+                            plan_name = row[col_idx.get("plan_name", 47)].strip() if "plan_name" in col_idx else ""
 
-                except Exception as e:
-                    st.error(f"ファイルの読み込みに失敗しました: {e}")
-            else:
-                st.warning("CSVファイルをアップロードしてください。")
+                            # Determine store: prefer 所属店舗名 (plan-level), fallback to メンバー所属店舗名
+                            store_full = ""
+                            if "store_name_full" in col_idx:
+                                store_full = row[col_idx["store_name_full"]].strip()
+                            if not store_full and "member_store_name_full" in col_idx:
+                                store_full = row[col_idx["member_store_name_full"]].strip()
+
+                            if not store_full:
+                                skipped += 1
+                                continue
+
+                            store_short = _map_hacomono_store(store_full)
+
+                            join_date = ""
+                            if "join_date" in col_idx:
+                                join_date = row[col_idx["join_date"]].strip()
+                            elif "join_datetime" in col_idx:
+                                join_date = row[col_idx["join_datetime"]].strip()
+
+                            tenure = row[col_idx.get("tenure", 56)].strip() if "tenure" in col_idx else ""
+
+                            records.append({
+                                "year": ml_year,
+                                "month": ml_month,
+                                "store_name": store_short,
+                                "member_id": member_id,
+                                "member_name": member_name,
+                                "plan_name": plan_name,
+                                "join_date": join_date,
+                                "tenure": tenure,
+                            })
+
+                            plan_counts[plan_name] = plan_counts.get(plan_name, 0) + 1
+                            store_counts[store_short] = store_counts.get(store_short, 0) + 1
+
+                        if records:
+                            save_member_data(records)
+                            st.success(f"✅ {ml_year}年{ml_month}月の会員データを取り込みました（{len(records)}名）")
+                            if skipped > 0:
+                                st.warning(f"⚠️ 店舗名が空の {skipped} 件はスキップしました")
+
+                            # Summary: store breakdown
+                            st.markdown("**店舗別会員数:**")
+                            store_df = pd.DataFrame(
+                                [{"店舗": k, "会員数": v} for k, v in sorted(store_counts.items(), key=lambda x: -x[1])]
+                            )
+                            st.dataframe(store_df, use_container_width=True, hide_index=True)
+
+                            # Summary: plan breakdown
+                            st.markdown("**プラン別会員数:**")
+                            plan_df = pd.DataFrame(
+                                [{"プラン名": k, "会員数": v} for k, v in sorted(plan_counts.items(), key=lambda x: -x[1])]
+                            )
+                            st.dataframe(plan_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.warning("データが見つかりませんでした。ファイルの形式を確認してください。")
+
+                    except Exception as e:
+                        st.error(f"ファイルの読み込みに失敗しました: {e}")
+                else:
+                    st.warning("CSVファイルをアップロードしてください。")
+
+        # ─── 売上データ (PA002) ────────────────────────────
+        with sub_sales:
+            st.markdown("#### 売上データ取込 (PA002)")
+            st.caption("hacomono「売上集計」クエリ PA002 の CSV をアップロード（店舗ごとにアップロード）")
+
+            col_store_r, col_year_r, col_month_r = st.columns(3)
+            with col_store_r:
+                rev_store = st.selectbox("対象店舗", STORES, key="rev_store")
+            with col_year_r:
+                rev_year = st.number_input("対象年", min_value=2020, max_value=2030, value=2026, key="rev_year")
+            with col_month_r:
+                rev_month = st.number_input("対象月", min_value=1, max_value=12, value=2, key="rev_month")
+
+            uploaded_pa = st.file_uploader(
+                "PA002 CSVをアップロード",
+                type=["csv"],
+                key="pa002_upload",
+            )
+
+            if uploaded_pa is not None:
+                st.info(f"📄 **{uploaded_pa.name}** → **{rev_store}** / {rev_year}年{rev_month}月")
+
+            if st.button("▶ 売上データを取り込む", type="primary", key="btn_pa002"):
+                if uploaded_pa is not None:
+                    file_bytes = uploaded_pa.read()
+                    try:
+                        # Try encodings
+                        text = None
+                        for enc in ["utf-8-sig", "utf-8", "cp932"]:
+                            try:
+                                text = file_bytes.decode(enc)
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                        if text is None:
+                            raise ValueError("CSVのエンコーディングを判定できませんでした")
+
+                        reader = csv.reader(io.StringIO(text))
+                        header = next(reader)
+
+                        # Find column indices by header name
+                        col_map = {}
+                        for i, h in enumerate(header):
+                            col_map[h.strip()] = i
+
+                        data_row = next(reader, None)
+                        if data_row is None:
+                            st.warning("データ行が見つかりませんでした。")
+                        else:
+                            def _get_val(col_name):
+                                idx = col_map.get(col_name)
+                                if idx is not None and idx < len(data_row):
+                                    try:
+                                        return float(data_row[idx].strip().replace(",", ""))
+                                    except (ValueError, TypeError):
+                                        return 0.0
+                                return 0.0
+
+                            target_ym = data_row[col_map.get("対象年月", 0)].strip() if "対象年月" in col_map else ""
+                            total_sales = _get_val("[総売上] 合計")
+                            sales_amount = _get_val("[売上] 合計")
+                            plan_sales_count = int(_get_val("[プラン売上] 件数"))
+                            plan_sales_total = _get_val("[プラン売上] 合計")
+                            plan_unit_price = _get_val("[プラン売上] 会員単価")
+
+                            # Detect year/month from 対象年月 if it looks like "202602"
+                            detected_year, detected_month = None, None
+                            if len(target_ym) == 6:
+                                try:
+                                    detected_year = int(target_ym[:4])
+                                    detected_month = int(target_ym[4:])
+                                except ValueError:
+                                    pass
+
+                            if detected_year and detected_month:
+                                st.info(f"CSVの対象年月: **{detected_year}年{detected_month}月**")
+
+                            st.markdown("**検出した売上データ:**")
+                            info_df = pd.DataFrame([{
+                                "総売上合計": f"¥{total_sales:,.0f}",
+                                "売上合計": f"¥{sales_amount:,.0f}",
+                                "プラン売上件数": f"{plan_sales_count}件",
+                                "プラン売上合計": f"¥{plan_sales_total:,.0f}",
+                                "プラン会員単価": f"¥{plan_unit_price:,.0f}",
+                            }])
+                            st.dataframe(info_df, use_container_width=True, hide_index=True)
+
+                            # Use detected year/month if available, otherwise use user-selected
+                            save_year = detected_year or rev_year
+                            save_month = detected_month or rev_month
+
+                            rev_records = [{
+                                "year": save_year,
+                                "month": save_month,
+                                "store_name": rev_store,
+                                "category": "売上",
+                                "amount": float(total_sales),
+                                "member_count": plan_sales_count,
+                                "note": f"PA002 | プラン売上: ¥{plan_sales_total:,.0f} | 会員単価: ¥{plan_unit_price:,.0f}",
+                            }]
+                            save_revenue_data(rev_records)
+                            st.success(f"✅ **{rev_store}** {save_year}年{save_month}月の売上データを保存しました")
+
+                    except Exception as e:
+                        st.error(f"ファイルの読み込みに失敗しました: {e}")
+                else:
+                    st.warning("CSVファイルをアップロードしてください。")

@@ -169,6 +169,21 @@ def init_db():
         )
     """)
 
+    # Member data from hacomono ML001
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS member_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER NOT NULL,
+            month INTEGER NOT NULL,
+            store_name TEXT NOT NULL,
+            member_id TEXT,
+            member_name TEXT,
+            plan_name TEXT,
+            join_date TEXT,
+            tenure TEXT
+        )
+    """)
+
     # Seed overrides if table is empty
     c.execute("SELECT COUNT(*) FROM store_overrides")
     if c.fetchone()[0] == 0:
@@ -394,7 +409,8 @@ def save_revenue_data(records: list[dict]):
     conn = get_connection()
     year = records[0]["year"]
     month = records[0]["month"]
-    conn.execute("DELETE FROM revenue_data WHERE year = ? AND month = ?", (year, month))
+    store_name = records[0].get("store_name", "")
+    conn.execute("DELETE FROM revenue_data WHERE year = ? AND month = ? AND store_name = ?", (year, month, store_name))
     for r in records:
         conn.execute(
             """INSERT INTO revenue_data (year, month, store_name, category, amount, member_count, note)
@@ -436,6 +452,57 @@ def get_revenue_months(year: int = None):
     return [(r["year"], r["month"]) for r in rows]
 
 
+# ─── Member Data ─────────────────────────────────────────────────────
+
+def save_member_data(records: list[dict]):
+    """Save member data from hacomono ML001. Replaces existing for same year/month."""
+    if not records:
+        return
+    conn = get_connection()
+    year = records[0]["year"]
+    month = records[0]["month"]
+    conn.execute("DELETE FROM member_data WHERE year = ? AND month = ?", (year, month))
+    for r in records:
+        conn.execute(
+            """INSERT INTO member_data (year, month, store_name, member_id, member_name, plan_name, join_date, tenure)
+               VALUES (:year, :month, :store_name, :member_id, :member_name, :plan_name, :join_date, :tenure)""",
+            r,
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_member_data(year: int, month: int = None, store: str = None):
+    conn = get_connection()
+    query = "SELECT * FROM member_data WHERE year = ?"
+    params = [year]
+    if month is not None:
+        query += " AND month = ?"
+        params.append(month)
+    if store is not None and store != "全体":
+        query += " AND store_name = ?"
+        params.append(store)
+    query += " ORDER BY store_name, plan_name, member_id"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_member_months(year: int = None):
+    conn = get_connection()
+    if year:
+        rows = conn.execute(
+            "SELECT DISTINCT year, month FROM member_data WHERE year = ? ORDER BY month",
+            (year,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT DISTINCT year, month FROM member_data ORDER BY year, month"
+        ).fetchall()
+    conn.close()
+    return [(r["year"], r["month"]) for r in rows]
+
+
 # ─── Data availability ───────────────────────────────────────────────
 
 def get_available_years():
@@ -445,6 +512,7 @@ def get_available_years():
             SELECT year FROM payroll_data
             UNION SELECT year FROM expense_data
             UNION SELECT year FROM revenue_data
+            UNION SELECT year FROM member_data
         ) ORDER BY year
     """).fetchall()
     conn.close()
@@ -458,7 +526,8 @@ def get_available_months(year: int):
             SELECT month FROM payroll_data WHERE year = ?
             UNION SELECT month FROM expense_data WHERE year = ?
             UNION SELECT month FROM revenue_data WHERE year = ?
+            UNION SELECT month FROM member_data WHERE year = ?
         ) ORDER BY month
-    """, (year, year, year)).fetchall()
+    """, (year, year, year, year)).fetchall()
     conn.close()
     return [r["month"] for r in rows]
