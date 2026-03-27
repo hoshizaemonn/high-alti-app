@@ -191,6 +191,26 @@ def init_db():
         )
     """)
 
+    # Monthly summary data from hacomono MA002
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER NOT NULL,
+            month INTEGER NOT NULL,
+            store_name TEXT NOT NULL DEFAULT '',
+            total_members INTEGER DEFAULT 0,
+            plan_subscribers INTEGER DEFAULT 0,
+            plan_subscribers_1st INTEGER DEFAULT 0,
+            new_registrations INTEGER DEFAULT 0,
+            new_plan_applications INTEGER DEFAULT 0,
+            new_plan_signups INTEGER DEFAULT 0,
+            plan_changes INTEGER DEFAULT 0,
+            suspensions INTEGER DEFAULT 0,
+            cancellations INTEGER DEFAULT 0,
+            cancellation_rate TEXT DEFAULT ''
+        )
+    """)
+
     # Migration: add columns if they don't exist (for existing DBs)
     try:
         c.execute("SELECT is_active FROM member_data LIMIT 1")
@@ -533,6 +553,68 @@ def get_member_months(year: int = None):
     return [(r["year"], r["month"]) for r in rows]
 
 
+def get_monthly_summary_months(year: int = None):
+    conn = get_connection()
+    if year:
+        rows = conn.execute(
+            "SELECT DISTINCT year, month FROM monthly_summary WHERE year = ? ORDER BY month",
+            (year,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT DISTINCT year, month FROM monthly_summary ORDER BY year, month"
+        ).fetchall()
+    conn.close()
+    return [(r["year"], r["month"]) for r in rows]
+
+
+# ─── Monthly Summary Data (MA002) ──────────────────────────────────
+
+def save_monthly_summary(records: list[dict]):
+    """Save monthly summary records from hacomono MA002. Replaces existing for same year/month/store."""
+    if not records:
+        return
+    conn = get_connection()
+    year = records[0]["year"]
+    month = records[0]["month"]
+    store_name = records[0].get("store_name", "")
+    conn.execute(
+        "DELETE FROM monthly_summary WHERE year = ? AND month = ? AND store_name = ?",
+        (year, month, store_name),
+    )
+    for r in records:
+        conn.execute(
+            """INSERT INTO monthly_summary (
+                year, month, store_name, total_members, plan_subscribers,
+                plan_subscribers_1st, new_registrations, new_plan_applications,
+                new_plan_signups, plan_changes, suspensions, cancellations, cancellation_rate
+            ) VALUES (
+                :year, :month, :store_name, :total_members, :plan_subscribers,
+                :plan_subscribers_1st, :new_registrations, :new_plan_applications,
+                :new_plan_signups, :plan_changes, :suspensions, :cancellations, :cancellation_rate
+            )""",
+            r,
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_monthly_summary(year: int, month: int = None, store: str = None):
+    conn = get_connection()
+    query = "SELECT * FROM monthly_summary WHERE year = ?"
+    params = [year]
+    if month is not None:
+        query += " AND month = ?"
+        params.append(month)
+    if store is not None and store != "全体":
+        query += " AND store_name = ?"
+        params.append(store)
+    query += " ORDER BY month, store_name"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_member_summary_stats(year: int, month: int, store: str = None) -> dict:
     """Compute summary stats from stored member records.
 
@@ -583,6 +665,7 @@ def get_available_years():
             UNION SELECT year FROM expense_data
             UNION SELECT year FROM revenue_data
             UNION SELECT year FROM member_data
+            UNION SELECT year FROM monthly_summary
         ) ORDER BY year
     """).fetchall()
     conn.close()
@@ -597,7 +680,8 @@ def get_available_months(year: int):
             UNION SELECT month FROM expense_data WHERE year = ?
             UNION SELECT month FROM revenue_data WHERE year = ?
             UNION SELECT month FROM member_data WHERE year = ?
+            UNION SELECT month FROM monthly_summary WHERE year = ?
         ) ORDER BY month
-    """, (year, year, year, year)).fetchall()
+    """, (year, year, year, year, year)).fetchall()
     conn.close()
     return [r["month"] for r in rows]

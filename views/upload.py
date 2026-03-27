@@ -9,7 +9,7 @@ import re
 from datetime import datetime, date
 from database import (
     save_payroll_data, save_expense_data, save_revenue_data,
-    save_member_data,
+    save_member_data, save_monthly_summary,
     upsert_override, STORES, EXPENSE_CATEGORIES,
 )
 from store_logic import resolve_store, apply_ratio
@@ -745,7 +745,7 @@ def render():
         st.subheader("hacomonoデータ取込")
         st.caption("hacomonoから出力したCSVをアップロード（会員リスト ML001 / 売上集計 PA002）")
 
-        sub_member, sub_sales = st.tabs(["👥 会員データ (ML001)", "💰 売上データ (PA002)"])
+        sub_member, sub_sales, sub_summary = st.tabs(["👥 会員データ (ML001)", "💰 売上データ (PA002)", "📊 月次サマリ (MA002)"])
 
         # ─── 会員データ (ML001) ────────────────────────────
         with sub_member:
@@ -905,5 +905,152 @@ def render():
 
                     except Exception as e:
                         st.error(f"ファイルの読み込みに失敗しました: {e}")
+                else:
+                    st.warning("CSVファイルをアップロードしてください。")
+
+        # ─── 月次サマリ (MA002) ────────────────────────────
+        with sub_summary:
+            st.markdown("#### 月次サマリ取込 (MA002)")
+            st.caption("hacomono「月次サマリ」クエリ MA002 の CSV をアップロード（UTF-8-sig, 1データ行）")
+
+            col_store_ma, col_year_ma, col_month_ma = st.columns(3)
+            with col_store_ma:
+                ma_store = st.selectbox("対象店舗", STORES, key="ma_store")
+            with col_year_ma:
+                ma_year = st.number_input("対象年", min_value=2020, max_value=2030, value=2026, key="ma_year")
+            with col_month_ma:
+                ma_month = st.number_input("対象月", min_value=1, max_value=12, value=2, key="ma_month")
+
+            uploaded_ma = st.file_uploader(
+                "MA002 CSVをアップロード",
+                type=["csv"],
+                key="ma002_upload",
+            )
+
+            if uploaded_ma is not None:
+                st.info(f"📄 **{uploaded_ma.name}** → **{ma_store}** / {ma_year}年{ma_month}月")
+
+            if st.button("▶ 月次サマリを取り込む", type="primary", key="btn_ma002"):
+                if uploaded_ma is not None:
+                    file_bytes = uploaded_ma.read()
+                    try:
+                        # Decode CSV
+                        text = None
+                        for enc in ["utf-8-sig", "utf-8", "cp932"]:
+                            try:
+                                text = file_bytes.decode(enc)
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                        if text is None:
+                            raise ValueError("CSVのエンコーディングを判定できませんでした")
+
+                        reader = csv.reader(io.StringIO(text))
+                        header = next(reader)
+
+                        # Build column index map
+                        hmap = {}
+                        for i, h in enumerate(header):
+                            hmap[h.strip()] = i
+
+                        data_row = next(reader, None)
+                        if data_row is None:
+                            st.warning("データ行が見つかりませんでした。")
+                        else:
+                            def _ma_get(col_name, default=""):
+                                idx = hmap.get(col_name)
+                                if idx is not None and idx < len(data_row):
+                                    return data_row[idx].strip()
+                                return default
+
+                            def _ma_int(col_name):
+                                val = _ma_get(col_name, "0")
+                                try:
+                                    return int(val.replace(",", ""))
+                                except (ValueError, TypeError):
+                                    return 0
+
+                            # Auto-detect year/month from 対象年月
+                            target_ym = _ma_get("対象年月")
+                            detected_year_ma, detected_month_ma = None, None
+                            if len(target_ym) == 6:
+                                try:
+                                    detected_year_ma = int(target_ym[:4])
+                                    detected_month_ma = int(target_ym[4:])
+                                except ValueError:
+                                    pass
+
+                            save_year_ma = detected_year_ma or ma_year
+                            save_month_ma = detected_month_ma or ma_month
+
+                            if detected_year_ma and detected_month_ma:
+                                st.info(f"CSVの対象年月: **{detected_year_ma}年{detected_month_ma}月**")
+
+                            total_members = _ma_int("店舗在籍会員数")
+                            plan_subscribers = _ma_int("プラン契約者数")
+                            plan_subscribers_1st = _ma_int("プラン契約者数 (1日時点)")
+                            new_registrations = _ma_int("店舗在籍新規会員登録数")
+                            new_plan_applications = _ma_int("プラン新規申込数")
+                            new_plan_signups = _ma_int("プラン新規入会数")
+                            plan_changes = _ma_int("プラン変更数")
+                            suspensions = _ma_int("休会数")
+                            cancellations = _ma_int("退会数")
+                            cancellation_rate = _ma_get("退会率")
+
+                            record = {
+                                "year": save_year_ma,
+                                "month": save_month_ma,
+                                "store_name": ma_store,
+                                "total_members": total_members,
+                                "plan_subscribers": plan_subscribers,
+                                "plan_subscribers_1st": plan_subscribers_1st,
+                                "new_registrations": new_registrations,
+                                "new_plan_applications": new_plan_applications,
+                                "new_plan_signups": new_plan_signups,
+                                "plan_changes": plan_changes,
+                                "suspensions": suspensions,
+                                "cancellations": cancellations,
+                                "cancellation_rate": cancellation_rate,
+                            }
+
+                            save_monthly_summary([record])
+                            st.success(
+                                f"✅ {save_year_ma}年{save_month_ma}月 **{ma_store}** の月次サマリを取り込みました"
+                            )
+
+                            # Show summary
+                            st.markdown("---")
+                            st.markdown("### 取込結果サマリー")
+
+                            k1, k2, k3 = st.columns(3)
+                            with k1:
+                                st.metric("在籍会員数", f"{total_members}名")
+                            with k2:
+                                st.metric("プラン契約者数", f"{plan_subscribers}名")
+                            with k3:
+                                st.metric("プラン契約者数（1日時点）", f"{plan_subscribers_1st}名")
+
+                            k4, k5, k6 = st.columns(3)
+                            with k4:
+                                st.metric("新規会員登録数", f"{new_registrations}名")
+                            with k5:
+                                st.metric("新規申込数", f"{new_plan_applications}名")
+                            with k6:
+                                st.metric("新規入会数", f"{new_plan_signups}名")
+
+                            k7, k8, k9 = st.columns(3)
+                            with k7:
+                                st.metric("プラン変更数", f"{plan_changes}件")
+                            with k8:
+                                st.metric("休会数", f"{suspensions}名")
+                            with k9:
+                                st.metric("退会数", f"{cancellations}名")
+
+                            st.metric("退会率", cancellation_rate)
+
+                    except Exception as e:
+                        st.error(f"ファイルの読み込みに失敗しました: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
                 else:
                     st.warning("CSVファイルをアップロードしてください。")

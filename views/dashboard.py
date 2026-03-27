@@ -7,6 +7,7 @@ import plotly.express as px
 from database import (
     get_payroll_data, get_expense_data, get_revenue_data, get_member_data,
     get_available_years, get_available_months, get_member_summary_stats,
+    get_monthly_summary,
     STORES, EXPENSE_CATEGORIES,
 )
 
@@ -296,11 +297,103 @@ def _render_monthly(year: int, month: int, store: str):
         df_exp_display["勘定科目"] = df_exp_display["勘定科目"].fillna("未分類")
         st.dataframe(df_exp_display, use_container_width=True, hide_index=True)
 
-    # Member data
+    # MA002 Monthly Summary (preferred for KPIs when available)
+    ma_records = get_monthly_summary(year, month, store)
+
+    # Member data (ML001 — always used for plan breakdown details)
     members = get_member_data(year, month, store)
     mem_sum = _compute_member_summary(members)
 
-    if mem_sum["total"] > 0:
+    if ma_records:
+        # Aggregate MA002 data (may have multiple store records when store == "全体")
+        ma_total_members = sum(r["total_members"] for r in ma_records)
+        ma_plan_subscribers = sum(r["plan_subscribers"] for r in ma_records)
+        ma_new_signups = sum(r["new_plan_signups"] for r in ma_records)
+        ma_cancellations = sum(r["cancellations"] for r in ma_records)
+        ma_suspensions = sum(r["suspensions"] for r in ma_records)
+        ma_new_registrations = sum(r["new_registrations"] for r in ma_records)
+        ma_new_applications = sum(r["new_plan_applications"] for r in ma_records)
+        ma_plan_changes = sum(r["plan_changes"] for r in ma_records)
+        # For cancellation rate, use single record or compute weighted
+        if len(ma_records) == 1:
+            ma_cancel_rate = ma_records[0]["cancellation_rate"]
+        else:
+            ma_cancel_rate = f"{ma_cancellations / ma_plan_subscribers * 100:.1f}%" if ma_plan_subscribers > 0 else "-"
+
+        st.markdown("---")
+        st.subheader("会員情報（MA002 月次サマリ）")
+
+        mk1, mk2, mk3 = st.columns(3)
+        with mk1:
+            st.metric("在籍会員数", f"{ma_total_members}名", key=f"ma_total_{year}_{month}_{store}")
+        with mk2:
+            st.metric("プラン契約者数", f"{ma_plan_subscribers}名", key=f"ma_plan_{year}_{month}_{store}")
+        with mk3:
+            st.metric("退会率", ma_cancel_rate, key=f"ma_rate_{year}_{month}_{store}")
+
+        mk4, mk5, mk6, mk7 = st.columns(4)
+        with mk4:
+            st.metric("新規入会", f"{ma_new_signups}名", key=f"ma_new_{year}_{month}_{store}")
+        with mk5:
+            st.metric("退会", f"{ma_cancellations}名", key=f"ma_cancel_{year}_{month}_{store}")
+        with mk6:
+            st.metric("休会", f"{ma_suspensions}名", key=f"ma_susp_{year}_{month}_{store}")
+        with mk7:
+            st.metric("新規会員登録", f"{ma_new_registrations}名", key=f"ma_reg_{year}_{month}_{store}")
+
+        # Additional details in expander
+        with st.expander("MA002 詳細", expanded=False):
+            detail_data = pd.DataFrame([{
+                "新規申込数": ma_new_applications,
+                "プラン変更数": ma_plan_changes,
+            }])
+            st.dataframe(detail_data, use_container_width=True, hide_index=True, key=f"ma_detail_{year}_{month}_{store}")
+
+            # Per-store breakdown if multiple records
+            if len(ma_records) > 1:
+                st.markdown("**店舗別**")
+                store_rows = []
+                for r in ma_records:
+                    store_rows.append({
+                        "店舗": r["store_name"],
+                        "在籍会員数": r["total_members"],
+                        "プラン契約者数": r["plan_subscribers"],
+                        "新規入会": r["new_plan_signups"],
+                        "退会": r["cancellations"],
+                        "休会": r["suspensions"],
+                        "退会率": r["cancellation_rate"],
+                    })
+                st.dataframe(pd.DataFrame(store_rows), use_container_width=True, hide_index=True, key=f"ma_stores_{year}_{month}_{store}")
+
+        # Still show ML001 plan breakdown if available
+        if mem_sum["total"] > 0:
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                st.markdown("**プラン別会員数（有効在籍 — ML001）**")
+                if mem_sum["active_by_plan"]:
+                    plan_data = sorted(mem_sum["active_by_plan"].items(), key=lambda x: -x[1])
+                    plan_df = pd.DataFrame(plan_data, columns=["プラン名", "会員数"])
+                    total_active = sum(v for _, v in plan_data)
+                    plan_df["構成比"] = plan_df["会員数"].apply(
+                        lambda x: f"{x / total_active * 100:.1f}%" if total_active > 0 else "0%"
+                    )
+                    st.dataframe(plan_df, use_container_width=True, hide_index=True, key=f"plan_tbl_{year}_{month}_{store}")
+
+            with mc2:
+                if mem_sum["active_by_plan"]:
+                    fig_plan = go.Figure(data=[go.Pie(
+                        labels=list(mem_sum["active_by_plan"].keys()),
+                        values=list(mem_sum["active_by_plan"].values()),
+                        hole=0.4,
+                    )])
+                    fig_plan.update_layout(
+                        title="プラン構成比（有効在籍）", height=350,
+                        margin=dict(l=20, r=20, t=40, b=20),
+                    )
+                    st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_pie_{year}_{month}_{store}")
+
+    elif mem_sum["total"] > 0:
+        # Fallback: no MA002 data, use ML001 computed stats (original behavior)
         st.markdown("---")
         st.subheader("会員情報")
 
@@ -375,6 +468,7 @@ def _render_annual(year: int, store: str):
         expenses = get_expense_data(year, m, store)
         revenue = get_revenue_data(year, m, store)
         members = get_member_data(year, m, store)
+        ma_records = get_monthly_summary(year, m, store)
 
         pay_sum = _compute_payroll_summary(payroll)
         exp_sum = _compute_expense_summary(expenses)
@@ -384,6 +478,26 @@ def _render_annual(year: int, store: str):
         total_labor = pay_sum["total_labor_cost"]
         total_expense = exp_sum["total"]
         total_rev = rev_sum["total"]
+
+        # MA002 aggregated values
+        ma_total_members = sum(r["total_members"] for r in ma_records) if ma_records else 0
+        ma_plan_subscribers = sum(r["plan_subscribers"] for r in ma_records) if ma_records else 0
+        ma_new_signups = sum(r["new_plan_signups"] for r in ma_records) if ma_records else 0
+        ma_cancellations = sum(r["cancellations"] for r in ma_records) if ma_records else 0
+        ma_suspensions = sum(r["suspensions"] for r in ma_records) if ma_records else 0
+        ma_new_registrations = sum(r["new_registrations"] for r in ma_records) if ma_records else 0
+        if ma_records:
+            if len(ma_records) == 1:
+                ma_cancel_rate_str = ma_records[0]["cancellation_rate"]
+            else:
+                ma_cancel_rate_str = f"{ma_cancellations / ma_plan_subscribers * 100:.1f}%" if ma_plan_subscribers > 0 else "-"
+            try:
+                ma_cancel_rate_num = float(ma_cancel_rate_str.replace("%", ""))
+            except (ValueError, TypeError):
+                ma_cancel_rate_num = 0.0
+        else:
+            ma_cancel_rate_str = ""
+            ma_cancel_rate_num = 0.0
 
         monthly_data.append({
             "month": m,
@@ -406,6 +520,16 @@ def _render_annual(year: int, store: str):
             "employee_count": pay_sum["employee_count"],
             "fulltime_count": pay_sum["fulltime_count"],
             "parttime_count": pay_sum["parttime_count"],
+            # MA002 fields
+            "ma_total_members": ma_total_members,
+            "ma_plan_subscribers": ma_plan_subscribers,
+            "ma_new_signups": ma_new_signups,
+            "ma_cancellations": ma_cancellations,
+            "ma_suspensions": ma_suspensions,
+            "ma_new_registrations": ma_new_registrations,
+            "ma_cancel_rate_str": ma_cancel_rate_str,
+            "ma_cancel_rate_num": ma_cancel_rate_num,
+            "has_ma": bool(ma_records),
             **{f"exp_{cat}": exp_sum["by_category"].get(cat, 0) for cat in EXPENSE_CATEGORIES},
         })
 
@@ -527,6 +651,116 @@ def _render_annual(year: int, store: str):
                     margin=dict(l=20, r=20, t=40, b=20),
                 )
                 st.plotly_chart(fig_pie, use_container_width=True, key=f"chart_pie_{year}_{store}")
+
+    # MA002 Monthly Summary charts (preferred when available)
+    has_ma_data = any(row["has_ma"] for row in monthly_data)
+    if has_ma_data:
+        st.markdown("---")
+        st.subheader("会員データ (MA002 月次サマリ)")
+
+        # Find latest month with MA002 data for snapshot
+        latest_ma_month = None
+        for row in reversed(monthly_data):
+            if row["has_ma"]:
+                latest_ma_month = row
+                break
+
+        if latest_ma_month:
+            mak1, mak2, mak3, mak4, mak5, mak6 = st.columns(6)
+            with mak1:
+                st.metric("在籍会員数", f"{latest_ma_month['ma_total_members']}名",
+                          help=f"{latest_ma_month['month_label']}時点",
+                          key=f"ann_ma_total_{year}_{store}")
+            with mak2:
+                st.metric("プラン契約者数", f"{latest_ma_month['ma_plan_subscribers']}名",
+                          key=f"ann_ma_plan_{year}_{store}")
+            with mak3:
+                st.metric("新規入会", f"{latest_ma_month['ma_new_signups']}名",
+                          key=f"ann_ma_new_{year}_{store}")
+            with mak4:
+                st.metric("退会", f"{latest_ma_month['ma_cancellations']}名",
+                          key=f"ann_ma_cancel_{year}_{store}")
+            with mak5:
+                st.metric("休会", f"{latest_ma_month['ma_suspensions']}名",
+                          key=f"ann_ma_susp_{year}_{store}")
+            with mak6:
+                st.metric("退会率", latest_ma_month['ma_cancel_rate_str'],
+                          key=f"ann_ma_rate_{year}_{store}")
+
+        # MA002 trend charts
+        ma_months = [row["month_label"] for row in monthly_data if row["has_ma"]]
+        ma_total = [row["ma_total_members"] for row in monthly_data if row["has_ma"]]
+        ma_plan_sub = [row["ma_plan_subscribers"] for row in monthly_data if row["has_ma"]]
+        ma_new = [row["ma_new_signups"] for row in monthly_data if row["has_ma"]]
+        ma_cancel = [row["ma_cancellations"] for row in monthly_data if row["has_ma"]]
+        ma_susp = [row["ma_suspensions"] for row in monthly_data if row["has_ma"]]
+        ma_rate = [row["ma_cancel_rate_num"] for row in monthly_data if row["has_ma"]]
+
+        if len(ma_months) > 0:
+            mac1, mac2 = st.columns(2)
+
+            with mac1:
+                fig_ma_member = go.Figure()
+                fig_ma_member.add_trace(go.Scatter(
+                    x=ma_months, y=ma_total,
+                    mode="lines+markers", name="在籍会員数",
+                    line=dict(color="#2196F3", width=3),
+                    marker=dict(size=8),
+                ))
+                fig_ma_member.add_trace(go.Scatter(
+                    x=ma_months, y=ma_plan_sub,
+                    mode="lines+markers", name="プラン契約者数",
+                    line=dict(color="#4CAF50", width=3),
+                    marker=dict(size=8),
+                ))
+                fig_ma_member.update_layout(
+                    title="在籍会員数推移（MA002）", xaxis_title="月", yaxis_title="人数",
+                    height=380, margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_ma_member, use_container_width=True, key=f"chart_ma_member_{year}_{store}")
+
+            with mac2:
+                fig_ma_churn = go.Figure()
+                fig_ma_churn.add_trace(go.Bar(
+                    x=ma_months, y=ma_new,
+                    name="新規入会", marker_color="#4CAF50",
+                    text=ma_new, textposition="auto",
+                ))
+                fig_ma_churn.add_trace(go.Bar(
+                    x=ma_months, y=ma_cancel,
+                    name="退会", marker_color="#F44336",
+                    text=ma_cancel, textposition="auto",
+                ))
+                fig_ma_churn.add_trace(go.Bar(
+                    x=ma_months, y=ma_susp,
+                    name="休会", marker_color="#FF9800",
+                    text=ma_susp, textposition="auto",
+                ))
+                fig_ma_churn.update_layout(
+                    title="新規入会 / 退会 / 休会推移", xaxis_title="月", yaxis_title="人数",
+                    barmode="group",
+                    height=380, margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_ma_churn, use_container_width=True, key=f"chart_ma_churn_{year}_{store}")
+
+            # Cancellation rate trend
+            if any(r > 0 for r in ma_rate):
+                mac3, mac4 = st.columns(2)
+                with mac3:
+                    fig_ma_rate = go.Figure()
+                    fig_ma_rate.add_trace(go.Scatter(
+                        x=ma_months, y=ma_rate,
+                        mode="lines+markers", name="退会率",
+                        line=dict(color="#F44336", width=3),
+                        marker=dict(size=8),
+                        text=[f"{r:.1f}%" for r in ma_rate],
+                        textposition="top center",
+                    ))
+                    fig_ma_rate.update_layout(
+                        title="退会率推移（MA002）", xaxis_title="月", yaxis_title="退会率（%）",
+                        height=350, margin=dict(l=20, r=20, t=40, b=20),
+                    )
+                    st.plotly_chart(fig_ma_rate, use_container_width=True, key=f"chart_ma_rate_{year}_{store}")
 
     # Member data charts (from ML001)
     has_member_data = any(row["member_count_ml"] > 0 for row in monthly_data)
