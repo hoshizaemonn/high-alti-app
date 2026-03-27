@@ -750,15 +750,14 @@ def render():
         # ─── 会員データ (ML001) ────────────────────────────
         with sub_member:
             st.markdown("#### 会員データ取込 (ML001)")
-            st.caption("hacomono「メンバー一覧」クエリ ML001 の CSV をアップロード（UTF-8-sig, 58列）")
+            st.caption("hacomono「メンバー一覧」CSVをアップロード — 常に最新データに上書きされます")
 
-            col_ym1, col_ym2, col_store_ml = st.columns(3)
-            with col_ym1:
-                ml_year = st.number_input("対象年", min_value=2020, max_value=2030, value=2026, key="ml_year")
-            with col_ym2:
-                ml_month = st.number_input("対象月", min_value=1, max_value=12, value=3, key="ml_month")
-            with col_store_ml:
-                ml_store = st.selectbox("対象店舗", STORES, key="ml_store")
+            from datetime import datetime as _dt
+            _now = _dt.now()
+            ml_year = _now.year
+            ml_month = _now.month
+
+            ml_store = st.selectbox("対象店舗", STORES, key="ml_store")
 
             uploaded_ml = st.file_uploader(
                 "ML001 CSVをアップロード",
@@ -767,7 +766,7 @@ def render():
             )
 
             if uploaded_ml is not None:
-                st.info(f"📄 **{uploaded_ml.name}** → **{ml_store}** / {ml_year}年{ml_month}月")
+                st.info(f"📄 **{uploaded_ml.name}** → **{ml_store}**（最新データとして取込）")
 
             if st.button("▶ 会員データを取り込む", type="primary", key="btn_ml001"):
                 if uploaded_ml is not None:
@@ -780,7 +779,7 @@ def render():
                         if records:
                             save_member_data(records)
                             st.success(
-                                f"✅ {ml_year}年{ml_month}月 **{ml_store}** の会員データを取り込みました"
+                                f"✅ **{ml_store}** の会員データを取り込みました"
                                 f"（{summary_info['total']}名）"
                             )
                             if summary_info.get("empty_store_count", 0) > 0:

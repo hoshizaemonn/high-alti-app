@@ -325,21 +325,21 @@ def _render_monthly(year: int, month: int, store: str):
 
         mk1, mk2, mk3 = st.columns(3)
         with mk1:
-            st.metric("在籍会員数", f"{ma_total_members}名", key=f"ma_total_{year}_{month}_{store}")
+            st.metric("在籍会員数", f"{ma_total_members}名")
         with mk2:
-            st.metric("プラン契約者数", f"{ma_plan_subscribers}名", key=f"ma_plan_{year}_{month}_{store}")
+            st.metric("プラン契約者数", f"{ma_plan_subscribers}名")
         with mk3:
-            st.metric("退会率", ma_cancel_rate, key=f"ma_rate_{year}_{month}_{store}")
+            st.metric("退会率", ma_cancel_rate)
 
         mk4, mk5, mk6, mk7 = st.columns(4)
         with mk4:
-            st.metric("新規入会", f"{ma_new_signups}名", key=f"ma_new_{year}_{month}_{store}")
+            st.metric("新規入会", f"{ma_new_signups}名")
         with mk5:
-            st.metric("退会", f"{ma_cancellations}名", key=f"ma_cancel_{year}_{month}_{store}")
+            st.metric("退会", f"{ma_cancellations}名")
         with mk6:
-            st.metric("休会", f"{ma_suspensions}名", key=f"ma_susp_{year}_{month}_{store}")
+            st.metric("休会", f"{ma_suspensions}名")
         with mk7:
-            st.metric("新規会員登録", f"{ma_new_registrations}名", key=f"ma_reg_{year}_{month}_{store}")
+            st.metric("新規会員登録", f"{ma_new_registrations}名")
 
         # Additional details in expander
         with st.expander("MA002 詳細", expanded=False):
@@ -347,7 +347,7 @@ def _render_monthly(year: int, month: int, store: str):
                 "新規申込数": ma_new_applications,
                 "プラン変更数": ma_plan_changes,
             }])
-            st.dataframe(detail_data, use_container_width=True, hide_index=True, key=f"ma_detail_{year}_{month}_{store}")
+            st.dataframe(detail_data, use_container_width=True, hide_index=True)
 
             # Per-store breakdown if multiple records
             if len(ma_records) > 1:
@@ -363,7 +363,7 @@ def _render_monthly(year: int, month: int, store: str):
                         "休会": r["suspensions"],
                         "退会率": r["cancellation_rate"],
                     })
-                st.dataframe(pd.DataFrame(store_rows), use_container_width=True, hide_index=True, key=f"ma_stores_{year}_{month}_{store}")
+                st.dataframe(pd.DataFrame(store_rows), use_container_width=True, hide_index=True)
 
         # Still show ML001 plan breakdown if available
         if mem_sum["total"] > 0:
@@ -669,23 +669,17 @@ def _render_annual(year: int, store: str):
             mak1, mak2, mak3, mak4, mak5, mak6 = st.columns(6)
             with mak1:
                 st.metric("在籍会員数", f"{latest_ma_month['ma_total_members']}名",
-                          help=f"{latest_ma_month['month_label']}時点",
-                          key=f"ann_ma_total_{year}_{store}")
+                          help=f"{latest_ma_month['month_label']}時点")
             with mak2:
-                st.metric("プラン契約者数", f"{latest_ma_month['ma_plan_subscribers']}名",
-                          key=f"ann_ma_plan_{year}_{store}")
+                st.metric("プラン契約者数", f"{latest_ma_month['ma_plan_subscribers']}名")
             with mak3:
-                st.metric("新規入会", f"{latest_ma_month['ma_new_signups']}名",
-                          key=f"ann_ma_new_{year}_{store}")
+                st.metric("新規入会", f"{latest_ma_month['ma_new_signups']}名")
             with mak4:
-                st.metric("退会", f"{latest_ma_month['ma_cancellations']}名",
-                          key=f"ann_ma_cancel_{year}_{store}")
+                st.metric("退会", f"{latest_ma_month['ma_cancellations']}名")
             with mak5:
-                st.metric("休会", f"{latest_ma_month['ma_suspensions']}名",
-                          key=f"ann_ma_susp_{year}_{store}")
+                st.metric("休会", f"{latest_ma_month['ma_suspensions']}名")
             with mak6:
-                st.metric("退会率", latest_ma_month['ma_cancel_rate_str'],
-                          key=f"ann_ma_rate_{year}_{store}")
+                st.metric("退会率", latest_ma_month['ma_cancel_rate_str'])
 
         # MA002 trend charts
         ma_months = [row["month_label"] for row in monthly_data if row["has_ma"]]
