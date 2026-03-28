@@ -44,12 +44,12 @@ def _compute_payroll_summary(payroll_records: list[dict]) -> dict:
         }
 
     df = pd.DataFrame(payroll_records)
-    gross = df["gross_total"].sum()
+    taxable = df["taxable_total"].sum()
     base = df["base_salary"].sum()
     position = df["position_allowance"].sum()
     overtime_pay = df["overtime_pay"].sum()
     commute = df["commute_taxable"].sum() + df["commute_nontax"].sum()
-    taxable = df["taxable_total"].sum()
+    gross = df["gross_total"].sum()
     sched_hours = df["scheduled_hours"].sum()
     ot_hours = df["overtime_hours"].sum()
     total_hours = sched_hours + ot_hours
@@ -69,26 +69,27 @@ def _compute_payroll_summary(payroll_records: list[dict]) -> dict:
     ft = df[df["contract_type"] == "正社員"]["employee_id"].nunique()
     pt = df[df["contract_type"] == "アルバイト"]["employee_id"].nunique()
 
-    ft_gross = df[df["contract_type"] == "正社員"]["gross_total"].sum()
-    pt_gross = df[df["contract_type"] == "アルバイト"]["gross_total"].sum()
+    # 課税支給合計ベースで算出
+    ft_taxable = df[df["contract_type"] == "正社員"]["taxable_total"].sum()
+    pt_taxable = df[df["contract_type"] == "アルバイト"]["taxable_total"].sum()
 
     return {
-        "gross_total": gross,
+        "gross_total": taxable,  # 課税支給合計を使用
         "base_salary": base,
         "position_allowance": position,
         "overtime_pay": overtime_pay,
         "commute_total": commute,
         "taxable_total": taxable,
         "legal_welfare": welfare,
-        "total_labor_cost": gross + welfare,
+        "total_labor_cost": taxable + welfare,  # 課税支給合計 + 法定福利
         "scheduled_hours": sched_hours,
         "overtime_hours": ot_hours,
         "total_hours": total_hours,
         "employee_count": unique_emp,
         "fulltime_count": ft,
         "parttime_count": pt,
-        "fulltime_gross": ft_gross,
-        "parttime_gross": pt_gross,
+        "fulltime_gross": ft_taxable,  # 正社員の課税支給合計
+        "parttime_gross": pt_taxable,  # アルバイトの課税支給合計
     }
 
 
@@ -222,7 +223,7 @@ def _render_monthly(year: int, month: int, store: str):
     other_pay = pay_sum["gross_total"] - pay_sum["base_salary"] - pay_sum["position_allowance"] - pay_sum["overtime_pay"] - pay_sum["commute_total"]
     if other_pay > 0:
         pl_rows.append({"科目": "  その他手当", "金額": _fmt(other_pay)})
-    pl_rows.append({"科目": "  支給合計", "金額": _fmt(pay_sum["gross_total"]), "_bold": True})
+    pl_rows.append({"科目": "  課税支給合計", "金額": _fmt(pay_sum["gross_total"]), "_bold": True})
     pl_rows.append({"科目": "  法定福利費（会社負担）", "金額": _fmt(pay_sum["legal_welfare"])})
     pl_rows.append({"科目": "  総勤務時間", "金額": f"{pay_sum['total_hours']:,.1f}h"})
     pl_rows.append({"科目": "人件費合計", "金額": _fmt(total_labor), "_bold": True})
@@ -270,7 +271,7 @@ def _render_monthly(year: int, month: int, store: str):
             + df_emp["pension_fund_co"] + df_emp["employment_insurance_co"]
             + df_emp["workers_comp_co"] + df_emp["general_contribution_co"]
         )
-        df_emp["人件費合計"] = df_emp["gross_total"] + df_emp["法定福利"]
+        df_emp["人件費合計"] = df_emp["taxable_total"] + df_emp["法定福利"]
         df_emp["総労働時間"] = df_emp["scheduled_hours"] + df_emp["overtime_hours"]
         df_emp["時給単価"] = df_emp.apply(
             lambda r: r["人件費合計"] / r["総労働時間"] if r["総労働時間"] > 0 else 0, axis=1
@@ -279,19 +280,19 @@ def _render_monthly(year: int, month: int, store: str):
         display_emp = df_emp[[
             "store_name", "employee_name", "contract_type",
             "base_salary", "position_allowance", "overtime_pay",
-            "gross_total", "法定福利", "人件費合計",
+            "taxable_total", "法定福利", "人件費合計",
             "scheduled_hours", "overtime_hours", "総労働時間", "時給単価",
         ]].copy()
 
         display_emp.columns = [
             "店舗", "氏名", "契約種別",
             "基本給", "役職手当", "残業手当",
-            "支給合計", "法定福利", "人件費合計",
+            "課税支給合計", "法定福利", "人件費合計",
             "所定時間", "残業時間", "総労働時間", "時給単価",
         ]
 
         # Format currency columns
-        for col in ["基本給", "役職手当", "残業手当", "支給合計", "法定福利", "人件費合計"]:
+        for col in ["基本給", "役職手当", "残業手当", "課税支給合計", "法定福利", "人件費合計"]:
             display_emp[col] = display_emp[col].apply(lambda x: f"¥{x:,.0f}")
 
         for col in ["所定時間", "残業時間", "総労働時間"]:
@@ -905,7 +906,7 @@ def _render_annual(year: int, store: str):
     table_data = {
         "科目": [
             "売上高", "正社員給与", "アルバイト給与",
-            "人件費（支給合計）", "法定福利費",
+            "人件費（課税支給合計）", "法定福利費",
             "人件費合計", "総勤務時間", "経費合計",
         ] + [cat for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
             "営業利益",
