@@ -191,7 +191,7 @@ def _render_monthly(year: int, month: int, store: str):
         with sk1:
             st.metric("正社員給与", _fmt(pay_sum["fulltime_gross"]))
         with sk2:
-            st.metric("アルバイト給与", _fmt(pay_sum["parttime_gross"]))
+            st.metric("契約社員給与", _fmt(pay_sum["parttime_gross"]))
         with sk3:
             st.metric("総勤務時間", f"{pay_sum['total_hours']:,.1f}h")
 
@@ -215,7 +215,7 @@ def _render_monthly(year: int, month: int, store: str):
     # Labor cost section
     pl_rows.append({"科目": "【人件費】", "金額": "", "_bold": True})
     pl_rows.append({"科目": "  正社員給与", "金額": _fmt(pay_sum["fulltime_gross"])})
-    pl_rows.append({"科目": "  アルバイト給与", "金額": _fmt(pay_sum["parttime_gross"])})
+    pl_rows.append({"科目": "  契約社員給与", "金額": _fmt(pay_sum["parttime_gross"])})
     pl_rows.append({"科目": "  基本給", "金額": _fmt(pay_sum["base_salary"])})
     pl_rows.append({"科目": "  役職手当", "金額": _fmt(pay_sum["position_allowance"])})
     pl_rows.append({"科目": "  残業手当", "金額": _fmt(pay_sum["overtime_pay"])})
@@ -905,7 +905,7 @@ def _render_annual(year: int, store: str):
 
     table_data = {
         "科目": [
-            "売上高", "正社員給与", "アルバイト給与",
+            "売上高", "正社員給与", "契約社員給与",
             "人件費（課税支給合計）", "法定福利費",
             "人件費合計", "総勤務時間", "経費合計",
         ] + [cat for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
