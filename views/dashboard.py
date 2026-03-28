@@ -656,36 +656,14 @@ def _render_annual(year: int, store: str):
     has_ma_data = any(row["has_ma"] for row in monthly_data)
     if has_ma_data:
         st.markdown("---")
-        st.subheader("会員データ (MA002 月次サマリ)")
-
-        # Find latest month with MA002 data for snapshot
-        latest_ma_month = None
-        for row in reversed(monthly_data):
-            if row["has_ma"]:
-                latest_ma_month = row
-                break
-
-        if latest_ma_month:
-            mak1, mak2, mak3, mak4, mak5, mak6 = st.columns(6)
-            with mak1:
-                st.metric("在籍会員数", f"{latest_ma_month['ma_total_members']}名",
-                          help=f"{latest_ma_month['month_label']}時点")
-            with mak2:
-                st.metric("プラン契約者数", f"{latest_ma_month['ma_plan_subscribers']}名")
-            with mak3:
-                st.metric("新規入会", f"{latest_ma_month['ma_new_signups']}名")
-            with mak4:
-                st.metric("退会", f"{latest_ma_month['ma_cancellations']}名")
-            with mak5:
-                st.metric("休会", f"{latest_ma_month['ma_suspensions']}名")
-            with mak6:
-                st.metric("退会率", latest_ma_month['ma_cancel_rate_str'])
+        st.subheader("会員推移（MA002 月次サマリ）")
 
         # MA002 trend charts
         ma_months = [row["month_label"] for row in monthly_data if row["has_ma"]]
         ma_total = [row["ma_total_members"] for row in monthly_data if row["has_ma"]]
         ma_plan_sub = [row["ma_plan_subscribers"] for row in monthly_data if row["has_ma"]]
         ma_new = [row["ma_new_signups"] for row in monthly_data if row["has_ma"]]
+        ma_new_reg = [row.get("ma_new_registrations", 0) for row in monthly_data if row["has_ma"]]
         ma_cancel = [row["ma_cancellations"] for row in monthly_data if row["has_ma"]]
         ma_susp = [row["ma_suspensions"] for row in monthly_data if row["has_ma"]]
         ma_rate = [row["ma_cancel_rate_num"] for row in monthly_data if row["has_ma"]]
@@ -716,6 +694,11 @@ def _render_annual(year: int, store: str):
             with mac2:
                 fig_ma_churn = go.Figure()
                 fig_ma_churn.add_trace(go.Bar(
+                    x=ma_months, y=ma_new_reg,
+                    name="新規会員登録", marker_color="#2196F3",
+                    text=ma_new_reg, textposition="auto",
+                ))
+                fig_ma_churn.add_trace(go.Bar(
                     x=ma_months, y=ma_new,
                     name="新規入会", marker_color="#4CAF50",
                     text=ma_new, textposition="auto",
@@ -731,7 +714,7 @@ def _render_annual(year: int, store: str):
                     text=ma_susp, textposition="auto",
                 ))
                 fig_ma_churn.update_layout(
-                    title="新規入会 / 退会 / 休会推移", xaxis_title="月", yaxis_title="人数",
+                    title="新規登録 / 入会 / 退会 / 休会推移", xaxis_title="月", yaxis_title="人数",
                     barmode="group",
                     height=380, margin=dict(l=20, r=20, t=40, b=20),
                 )
@@ -760,7 +743,8 @@ def _render_annual(year: int, store: str):
     has_member_data = any(row["member_count_ml"] > 0 for row in monthly_data)
     if has_member_data:
         st.markdown("---")
-        st.subheader("会員データ (hacomono)")
+        from datetime import datetime as _dt
+        st.subheader(f"会員データ（{_dt.now().strftime('%Y年%-m月%-d日')}現在）")
 
         # Find latest month with data for snapshot
         latest_member_month = None
