@@ -212,6 +212,24 @@ def init_db():
         )
     """)
 
+    # Sales detail data from hacomono PL001
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sales_detail (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER NOT NULL,
+            month INTEGER NOT NULL,
+            store_name TEXT NOT NULL,
+            sale_id TEXT,
+            sale_date TEXT,
+            payment_method TEXT,
+            description TEXT,
+            category TEXT,
+            amount INTEGER DEFAULT 0,
+            tax INTEGER DEFAULT 0,
+            discount INTEGER DEFAULT 0
+        )
+    """)
+
     # Migration: add columns if they don't exist (for existing DBs)
     try:
         c.execute("SELECT is_active FROM member_data LIMIT 1")
@@ -659,6 +677,99 @@ def get_member_summary_stats(year: int, month: int, store: str = None) -> dict:
     }
 
 
+# ─── Sales Detail Data (PL001) ──────────────────────────────────────
+
+SALES_CATEGORIES = [
+    "月会費", "入会金", "パーソナル", "オプション",
+    "スポット", "体験", "ロッカー", "クーポン/割引", "その他",
+]
+
+
+def classify_sale_category(description: str, amount: int) -> str:
+    """Auto-classify a sale description into a category."""
+    if not description:
+        return "その他"
+    d = description
+    # Check クーポン/割引 early (before 入会金 which may appear in coupon descriptions)
+    if "クーポン" in d or amount < 0:
+        return "クーポン/割引"
+    if "月会費" in d:
+        return "月会費"
+    if "入会金" in d or "事務手数料" in d or "忘れ物カルテ" in d:
+        return "入会金"
+    if "パーソナル" in d:
+        return "パーソナル"
+    if "アスリート" in d or "BOOST" in d or "飲むハイアルチ" in d or "NMN" in d or "BJ" in d:
+        return "オプション"
+    if "スポット" in d:
+        return "スポット"
+    if "体験" in d:
+        return "体験"
+    if "ロッカー" in d:
+        return "ロッカー"
+    return "その他"
+
+
+def save_sales_detail(records: list[dict]):
+    """Save sales detail records from hacomono PL001. Replaces existing for same year/month/store."""
+    if not records:
+        return
+    conn = get_connection()
+    year = records[0]["year"]
+    month = records[0]["month"]
+    store_name = records[0].get("store_name", "")
+    conn.execute(
+        "DELETE FROM sales_detail WHERE year = ? AND month = ? AND store_name = ?",
+        (year, month, store_name),
+    )
+    for r in records:
+        conn.execute(
+            """INSERT INTO sales_detail (
+                year, month, store_name, sale_id, sale_date,
+                payment_method, description, category,
+                amount, tax, discount
+            ) VALUES (
+                :year, :month, :store_name, :sale_id, :sale_date,
+                :payment_method, :description, :category,
+                :amount, :tax, :discount
+            )""",
+            r,
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_sales_detail(year: int, month: int = None, store: str = None):
+    conn = get_connection()
+    query = "SELECT * FROM sales_detail WHERE year = ?"
+    params = [year]
+    if month is not None:
+        query += " AND month = ?"
+        params.append(month)
+    if store is not None and store != "全体":
+        query += " AND store_name = ?"
+        params.append(store)
+    query += " ORDER BY month, sale_date"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_sales_detail_months(year: int = None):
+    conn = get_connection()
+    if year:
+        rows = conn.execute(
+            "SELECT DISTINCT year, month FROM sales_detail WHERE year = ? ORDER BY month",
+            (year,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT DISTINCT year, month FROM sales_detail ORDER BY year, month"
+        ).fetchall()
+    conn.close()
+    return [(r["year"], r["month"]) for r in rows]
+
+
 # ─── Data availability ───────────────────────────────────────────────
 
 def get_available_years():
@@ -670,6 +781,7 @@ def get_available_years():
             UNION SELECT year FROM revenue_data
             UNION SELECT year FROM member_data
             UNION SELECT year FROM monthly_summary
+            UNION SELECT year FROM sales_detail
         ) ORDER BY year
     """).fetchall()
     conn.close()
@@ -685,7 +797,8 @@ def get_available_months(year: int):
             UNION SELECT month FROM revenue_data WHERE year = ?
             UNION SELECT month FROM member_data WHERE year = ?
             UNION SELECT month FROM monthly_summary WHERE year = ?
+            UNION SELECT month FROM sales_detail WHERE year = ?
         ) ORDER BY month
-    """, (year, year, year, year, year)).fetchall()
+    """, (year, year, year, year, year, year)).fetchall()
     conn.close()
     return [r["month"] for r in rows]

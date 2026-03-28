@@ -7,7 +7,7 @@ import plotly.express as px
 from database import (
     get_payroll_data, get_expense_data, get_revenue_data, get_member_data,
     get_available_years, get_available_months, get_member_summary_stats,
-    get_monthly_summary,
+    get_monthly_summary, get_sales_detail, SALES_CATEGORIES,
     STORES, HQ_STORE, EXPENSE_CATEGORIES,
 )
 
@@ -146,6 +146,20 @@ def _compute_member_summary(member_records: list[dict]) -> dict:
     }
 
 
+def _compute_sales_detail_summary(sales_records: list[dict]) -> dict:
+    """Compute sales detail aggregates from PL001 records."""
+    if not sales_records:
+        return {"total": 0, "by_category": {}, "count": 0, "by_store": {}}
+
+    df = pd.DataFrame(sales_records)
+    total = df["amount"].sum()
+    count = len(df)
+    by_cat = df.groupby("category")["amount"].sum().to_dict()
+    by_store = df.groupby("store_name")["amount"].sum().to_dict()
+
+    return {"total": total, "by_category": by_cat, "count": count, "by_store": by_store}
+
+
 def _compute_revenue_summary(revenue_records: list[dict]) -> dict:
     if not revenue_records:
         return {"total": 0, "by_store": {}, "member_count": 0}
@@ -163,12 +177,16 @@ def _render_monthly(year: int, month: int, store: str):
     payroll = get_payroll_data(year, month, store)
     expenses = get_expense_data(year, month, store)
     revenue = get_revenue_data(year, month, store)
+    sales_detail = get_sales_detail(year, month, store)
 
     pay_sum = _compute_payroll_summary(payroll)
     exp_sum = _compute_expense_summary(expenses)
     rev_sum = _compute_revenue_summary(revenue)
+    sd_sum = _compute_sales_detail_summary(sales_detail)
 
-    total_revenue = rev_sum["total"]
+    # Use sales_detail total as revenue when available, otherwise fall back to revenue_data
+    has_sales_detail = sd_sum["total"] != 0 or sd_sum["count"] > 0
+    total_revenue = sd_sum["total"] if has_sales_detail else rev_sum["total"]
     total_labor = pay_sum["total_labor_cost"]
     total_expense = exp_sum["total"]
     operating_profit = total_revenue - total_labor - total_expense
@@ -184,6 +202,19 @@ def _render_monthly(year: int, month: int, store: str):
         _kpi_card("経費合計", total_expense, inverse=True)
     with k4:
         _kpi_card("営業利益", operating_profit)
+
+    # Sub-KPI row: sales detail key categories
+    if has_sales_detail:
+        sd_monthly_fee = sd_sum["by_category"].get("月会費", 0)
+        sd_personal = sd_sum["by_category"].get("パーソナル", 0)
+        sd_option = sd_sum["by_category"].get("オプション", 0)
+        sk1, sk2, sk3 = st.columns(3)
+        with sk1:
+            st.metric("月会費", _fmt(sd_monthly_fee))
+        with sk2:
+            st.metric("パーソナル", _fmt(sd_personal))
+        with sk3:
+            st.metric("オプション", _fmt(sd_option))
 
     # Sub-KPI row: payroll breakdown and total hours
     if pay_sum["total_hours"] > 0 or pay_sum["fulltime_gross"] > 0:
@@ -203,7 +234,15 @@ def _render_monthly(year: int, month: int, store: str):
 
     # Revenue section
     pl_rows.append({"科目": "【売上高】", "金額": "", "_bold": True})
-    if rev_sum["by_store"]:
+    if has_sales_detail:
+        # Show category breakdown from sales_detail
+        for cat in SALES_CATEGORIES:
+            amt = sd_sum["by_category"].get(cat, 0)
+            if amt != 0:
+                pl_rows.append({"科目": f"  {cat}", "金額": _fmt(amt)})
+        if sd_sum["count"] > 0:
+            pl_rows.append({"科目": f"  （取引件数: {sd_sum['count']}件）", "金額": ""})
+    elif rev_sum["by_store"]:
         for s, amt in rev_sum["by_store"].items():
             pl_rows.append({"科目": f"  {s}", "金額": _fmt(amt)})
     else:
@@ -492,17 +531,20 @@ def _render_annual(year: int, store: str):
         payroll = get_payroll_data(year, m, store)
         expenses = get_expense_data(year, m, store)
         revenue = get_revenue_data(year, m, store)
+        sales_detail = get_sales_detail(year, m, store)
         members = get_member_data(year, m, store)
         ma_records = get_monthly_summary(year, m, store)
 
         pay_sum = _compute_payroll_summary(payroll)
         exp_sum = _compute_expense_summary(expenses)
         rev_sum = _compute_revenue_summary(revenue)
+        sd_sum = _compute_sales_detail_summary(sales_detail)
         mem_sum = _compute_member_summary(members)
 
         total_labor = pay_sum["total_labor_cost"]
         total_expense = exp_sum["total"]
-        total_rev = rev_sum["total"]
+        has_sd = sd_sum["total"] != 0 or sd_sum["count"] > 0
+        total_rev = sd_sum["total"] if has_sd else rev_sum["total"]
 
         # MA002 aggregated values
         ma_total_members = sum(r["total_members"] for r in ma_records) if ma_records else 0
@@ -558,6 +600,8 @@ def _render_annual(year: int, store: str):
             "ma_cancel_rate_str": ma_cancel_rate_str,
             "ma_cancel_rate_num": ma_cancel_rate_num,
             "has_ma": bool(ma_records),
+            "has_sd": has_sd,
+            **{f"sd_{cat}": sd_sum["by_category"].get(cat, 0) for cat in SALES_CATEGORIES},
             **{f"exp_{cat}": exp_sum["by_category"].get(cat, 0) for cat in EXPENSE_CATEGORIES},
         })
 
@@ -590,12 +634,28 @@ def _render_annual(year: int, store: str):
     c1, c2 = st.columns(2)
 
     with c1:
-        # Revenue trend (stacked bar by category — for now just total since we don't have category breakdown)
+        has_any_sd = any(row["has_sd"] for row in monthly_data)
         fig_rev = go.Figure()
-        fig_rev.add_trace(go.Bar(
-            x=df["month_label"], y=df["revenue"],
-            name="売上", marker_color="#2196F3",
-        ))
+        if has_any_sd:
+            # Stacked bar by sales category
+            sd_colors = {
+                "月会費": "#2196F3", "パーソナル": "#4CAF50", "オプション": "#FF9800",
+                "入会金": "#9C27B0", "スポット": "#00BCD4", "体験": "#E91E63",
+                "ロッカー": "#795548", "クーポン/割引": "#F44336", "その他": "#607D8B",
+            }
+            for cat in SALES_CATEGORIES:
+                col_name = f"sd_{cat}"
+                if col_name in df.columns and df[col_name].sum() != 0:
+                    fig_rev.add_trace(go.Bar(
+                        x=df["month_label"], y=df[col_name],
+                        name=cat, marker_color=sd_colors.get(cat, "#607D8B"),
+                    ))
+            fig_rev.update_layout(barmode="stack")
+        else:
+            fig_rev.add_trace(go.Bar(
+                x=df["month_label"], y=df["revenue"],
+                name="売上", marker_color="#2196F3",
+            ))
         fig_rev.update_layout(
             title="売上推移", xaxis_title="月", yaxis_title="金額（円）",
             height=350, margin=dict(l=20, r=20, t=40, b=20),

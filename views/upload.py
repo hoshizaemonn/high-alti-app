@@ -9,7 +9,8 @@ import re
 from datetime import datetime, date
 from database import (
     save_payroll_data, save_expense_data, save_revenue_data,
-    save_member_data, save_monthly_summary,
+    save_member_data, save_monthly_summary, save_sales_detail,
+    classify_sale_category, SALES_CATEGORIES,
     upsert_override, STORES, HQ_STORE, EXPENSE_CATEGORIES,
 )
 
@@ -774,9 +775,9 @@ def render():
     # ─── 売上・会員 Upload (hacomono) ─────────────────────────
     with tab_revenue:
         st.subheader("hacomonoデータ取込")
-        st.caption("hacomonoから出力したCSVをアップロード（会員リスト ML001 / 売上集計 PA002）")
+        st.caption("hacomonoから出力したCSVをアップロード（会員リスト ML001 / 売上集計 PA002 / 売上明細 PL001）")
 
-        sub_member, sub_sales, sub_summary = st.tabs(["👥 会員データ (ML001)", "💰 売上データ (PA002)", "📊 月次サマリ (MA002)"])
+        sub_member, sub_sales, sub_sales_detail, sub_summary = st.tabs(["👥 会員データ (ML001)", "💰 売上データ (PA002)", "🧾 売上明細 (PL001)", "📊 月次サマリ (MA002)"])
 
         # ─── 会員データ (ML001) ────────────────────────────
         with sub_member:
@@ -935,6 +936,165 @@ def render():
 
                     except Exception as e:
                         st.error(f"ファイルの読み込みに失敗しました: {e}")
+                else:
+                    st.warning("CSVファイルをアップロードしてください。")
+
+        # ─── 売上明細 (PL001) ────────────────────────────
+        with sub_sales_detail:
+            st.markdown("#### 売上明細データ取込 (PL001)")
+            st.caption("hacomono「売上明細」クエリ PL001 の CSV をアップロード（UTF-8-sig, 全取引データ）")
+
+            col_store_pl, col_year_pl, col_month_pl = st.columns(3)
+            with col_store_pl:
+                pl_store = st.selectbox("対象店舗", STORES, key="pl_store")
+            with col_year_pl:
+                pl_year = st.number_input("対象年", min_value=2020, max_value=2030, value=2026, key="pl_year")
+            with col_month_pl:
+                pl_month = st.number_input("対象月", min_value=1, max_value=12, value=2, key="pl_month")
+
+            uploaded_pl = st.file_uploader(
+                "PL001 CSVをアップロード",
+                type=["csv"],
+                key="pl001_upload",
+            )
+
+            if uploaded_pl is not None:
+                st.info(f"📄 **{uploaded_pl.name}** → **{pl_store}** / {pl_year}年{pl_month}月")
+
+            if st.button("▶ 売上明細を取り込む", type="primary", key="btn_pl001"):
+                if uploaded_pl is not None:
+                    file_bytes = uploaded_pl.read()
+                    try:
+                        # Decode CSV
+                        text = None
+                        for enc in ["utf-8-sig", "utf-8", "cp932"]:
+                            try:
+                                text = file_bytes.decode(enc)
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                        if text is None:
+                            raise ValueError("CSVのエンコーディングを判定できませんでした")
+
+                        reader = csv.reader(io.StringIO(text))
+                        header = next(reader)
+
+                        # Build column index map
+                        hmap = {}
+                        for i, h in enumerate(header):
+                            hmap[h.strip()] = i
+
+                        def _pl_get(row, col_name, default=""):
+                            idx = hmap.get(col_name)
+                            if idx is not None and idx < len(row):
+                                return row[idx].strip()
+                            return default
+
+                        def _pl_int(row, col_name):
+                            val = _pl_get(row, col_name, "0")
+                            try:
+                                return int(val.replace(",", ""))
+                            except (ValueError, TypeError):
+                                return 0
+
+                        records = []
+                        detected_year_pl = None
+                        detected_month_pl = None
+
+                        for row in reader:
+                            if len(row) < 5:
+                                continue
+
+                            sale_id = _pl_get(row, "売上ID")
+                            sale_date = _pl_get(row, "精算日時")
+                            store_full = _pl_get(row, "購入店舗")
+                            payment_method = _pl_get(row, "支払方法")
+                            description = _pl_get(row, "摘要")
+                            amount = _pl_int(row, "合計金額")
+                            tax = _pl_int(row, "内税")
+                            discount = _pl_int(row, "割引金額")
+
+                            # Map store name
+                            store_short = _map_hacomono_store(store_full) if store_full else pl_store
+
+                            # Auto-detect year/month from first row's date
+                            if detected_year_pl is None and sale_date:
+                                dt = _parse_date_loose(sale_date)
+                                if dt:
+                                    detected_year_pl = dt.year
+                                    detected_month_pl = dt.month
+
+                            category = classify_sale_category(description, amount)
+
+                            records.append({
+                                "year": pl_year,  # will be overridden below if detected
+                                "month": pl_month,
+                                "store_name": store_short,
+                                "sale_id": sale_id,
+                                "sale_date": sale_date,
+                                "payment_method": payment_method,
+                                "description": description,
+                                "category": category,
+                                "amount": amount,
+                                "tax": tax,
+                                "discount": discount,
+                            })
+
+                        # Override year/month if detected
+                        if detected_year_pl and detected_month_pl:
+                            st.info(f"CSVから **{detected_year_pl}年{detected_month_pl}月** のデータを検出しました")
+                            for r in records:
+                                r["year"] = detected_year_pl
+                                r["month"] = detected_month_pl
+                            save_year_pl = detected_year_pl
+                            save_month_pl = detected_month_pl
+                        else:
+                            save_year_pl = pl_year
+                            save_month_pl = pl_month
+
+                        if records:
+                            save_sales_detail(records)
+
+                            # Summary
+                            total_amount = sum(r["amount"] for r in records)
+                            cat_breakdown = {}
+                            for r in records:
+                                cat = r["category"]
+                                cat_breakdown[cat] = cat_breakdown.get(cat, 0) + r["amount"]
+
+                            st.success(
+                                f"✅ **{pl_store}** {save_year_pl}年{save_month_pl}月の売上明細を取り込みました"
+                                f"（{len(records)}件）"
+                            )
+
+                            st.markdown("---")
+                            st.markdown("### 取込結果サマリー")
+
+                            sk1, sk2 = st.columns(2)
+                            with sk1:
+                                st.metric("売上合計", f"¥{total_amount:,.0f}")
+                            with sk2:
+                                st.metric("取引件数", f"{len(records)}件")
+
+                            # Category breakdown
+                            st.markdown("**カテゴリ別内訳**")
+                            cat_data = sorted(cat_breakdown.items(), key=lambda x: -x[1])
+                            cat_df = pd.DataFrame(cat_data, columns=["カテゴリ", "金額"])
+                            cat_df["構成比"] = cat_df["金額"].apply(
+                                lambda x: f"{x / total_amount * 100:.1f}%" if total_amount != 0 else "0%"
+                            )
+                            cat_df["件数"] = [
+                                sum(1 for r in records if r["category"] == cat) for cat, _ in cat_data
+                            ]
+                            cat_df["金額"] = cat_df["金額"].apply(lambda x: f"¥{x:,.0f}")
+                            st.dataframe(cat_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.warning("データが見つかりませんでした。ファイルの形式を確認してください。")
+
+                    except Exception as e:
+                        st.error(f"ファイルの読み込みに失敗しました: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
                 else:
                     st.warning("CSVファイルをアップロードしてください。")
 
