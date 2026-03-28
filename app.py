@@ -28,6 +28,15 @@ st.markdown("""
     [data-testid="stAppDeployButton"] {display: none;}
     footer {visibility: hidden;}
 
+    /* Print: hide sidebar and header, full width */
+    @media print {
+        [data-testid="stSidebar"] {display: none !important;}
+        [data-testid="stSidebarCollapsedControl"] {display: none !important;}
+        header {display: none !important;}
+        .stMainBlockContainer {max-width: 100% !important; padding: 0 !important;}
+        [data-testid="stToolbar"] {display: none !important;}
+    }
+
     /* KPI cards */
     [data-testid="stMetric"] {
         background: #f8f9fa;
