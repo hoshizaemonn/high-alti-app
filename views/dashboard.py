@@ -81,7 +81,7 @@ def _compute_payroll_summary(payroll_records: list[dict]) -> dict:
         "commute_total": commute,
         "taxable_total": taxable,
         "legal_welfare": welfare,
-        "total_labor_cost": taxable + welfare,  # 課税支給合計 + 法定福利
+        "total_labor_cost": taxable + welfare + commute,  # 課税支給合計 + 法定福利 + 通勤手当
         "scheduled_hours": sched_hours,
         "overtime_hours": ot_hours,
         "total_hours": total_hours,
