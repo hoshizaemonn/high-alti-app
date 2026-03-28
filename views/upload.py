@@ -586,7 +586,8 @@ def render():
             if detected_year and detected_month:
                 st.success(f"ファイル名から **{detected_year}年{detected_month}月** を検出しました")
 
-            if st.button("▶ 人件費データを取り込む", type="primary", key="btn_payroll"):
+            # Step 1: Parse
+            if st.button("▶ 人件費データを解析する", type="primary", key="btn_payroll_parse"):
                 with st.spinner("解析中..."):
                     file_bytes = uploaded_payroll.read()
 
@@ -595,31 +596,55 @@ def render():
                     else:
                         records, unresolved = parse_payroll_excel(file_bytes, payroll_year, payroll_month)
 
-                # Handle unresolved employees
+                st.session_state["payroll_records"] = records
+                st.session_state["payroll_unresolved"] = unresolved
+                st.session_state["payroll_meta"] = {"year": payroll_year, "month": payroll_month}
+                st.session_state["payroll_file_bytes"] = file_bytes
+                st.session_state["payroll_filename"] = filename
+
+            # Step 2: Show results and handle unresolved
+            if "payroll_unresolved" in st.session_state:
+                unresolved = st.session_state["payroll_unresolved"]
+                records = st.session_state["payroll_records"]
+                meta = st.session_state["payroll_meta"]
+
                 if unresolved:
-                    st.warning(f"⚠️ 店舗が不明な従業員が {len(unresolved)} 名います")
+                    st.warning(f"⚠️ 店舗が不明な従業員が {len(unresolved)} 名います。店舗を選んでから「保存」を押してください。")
 
                     for emp in unresolved:
                         with st.container():
                             st.markdown(f"**{emp['employee_name']}** (ID: {emp['employee_id']}, {emp['contract_type']}, ¥{emp['gross_total']:,.0f})")
-                            assign_col1, assign_col2 = st.columns([3, 1])
-                            with assign_col1:
-                                selected_store = st.selectbox(
-                                    f"店舗 — {emp['employee_name']}",
-                                    STORE_OPTIONS_WITH_HQ,
-                                    key=f"assign_{emp['employee_id']}",
-                                    label_visibility="collapsed",
-                                )
-                            with assign_col2:
-                                if st.button("登録", key=f"btn_assign_{emp['employee_id']}"):
-                                    emp_id = int(emp["employee_id"])
-                                    upsert_override(emp_id, selected_store, 100)
-                                    st.success(f"✅ {emp['employee_name']} → {selected_store}")
-                                    st.rerun()
+                            selected_store = st.selectbox(
+                                f"店舗 — {emp['employee_name']}",
+                                STORE_OPTIONS_WITH_HQ,
+                                key=f"assign_{emp['employee_id']}",
+                                label_visibility="collapsed",
+                            )
+                            emp["_selected_store"] = selected_store
 
                 if records:
+                    st.info(f"解析完了: {len(records)}件（振り分け済み）+ {len(unresolved)}件（未登録）")
+
+                # Step 3: Save
+                st.markdown("---")
+                if st.button("💾 この内容で保存する", type="primary", key="btn_payroll_save"):
+                    # Register unresolved employees first
+                    for emp in unresolved:
+                        store = emp.get("_selected_store", STORE_OPTIONS_WITH_HQ[0])
+                        emp_id = int(emp["employee_id"])
+                        upsert_override(emp_id, store, 100)
+
+                    if unresolved and "payroll_file_bytes" in st.session_state:
+                        # Re-parse with new registrations
+                        file_bytes = st.session_state["payroll_file_bytes"]
+                        fn = st.session_state.get("payroll_filename", "")
+                        if fn.endswith(".csv"):
+                            records, _ = parse_payroll_csv(file_bytes, meta["year"], meta["month"])
+                        else:
+                            records, _ = parse_payroll_excel(file_bytes, meta["year"], meta["month"])
+
                     save_payroll_data(records)
-                    st.success(f"✅ {payroll_year}年{payroll_month}月の人件費データを取り込みました（{len(records)}件）")
+                    st.success(f"✅ {meta['year']}年{meta['month']}月の人件費データを保存しました（{len(records)}件）")
 
                     # Summary
                     df = pd.DataFrame(records)
@@ -632,8 +657,11 @@ def render():
                     summary["課税支給合計"] = summary["課税支給合計"].apply(lambda x: f"¥{x:,.0f}")
                     summary["総勤務時間"] = summary["総勤務時間"].apply(lambda x: f"{x:,.0f}h")
                     st.dataframe(summary, use_container_width=True, hide_index=True)
-                elif not unresolved:
-                    st.warning("データが見つかりませんでした。ファイルの形式を確認してください。")
+
+                    # Clear session state
+                    for key in ["payroll_records", "payroll_unresolved", "payroll_meta", "payroll_file_bytes"]:
+                        if key in st.session_state:
+                            del st.session_state[key]
 
     # ─── 経費 Upload ──────────────────────────────────────────
     with tab_expense:
