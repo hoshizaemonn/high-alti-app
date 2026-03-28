@@ -8,6 +8,7 @@ DB_DIR = Path(__file__).parent / "data"
 DB_PATH = DB_DIR / "highalt.db"
 
 STORES = ["東日本橋", "春日", "船橋", "巣鴨", "祖師ヶ谷大蔵", "下北沢", "中目黒"]
+HQ_STORE = "本部（除外）"
 
 # Thousand-digit → store mapping
 THOUSAND_DIGIT_MAP = {
@@ -358,7 +359,7 @@ def save_payroll_data(records: list[dict]):
     conn.close()
 
 
-def get_payroll_data(year: int, month: int = None, store: str = None):
+def get_payroll_data(year: int, month: int = None, store: str = None, include_hq: bool = False):
     conn = get_connection()
     query = "SELECT * FROM payroll_data WHERE year = ?"
     params = [year]
@@ -368,6 +369,9 @@ def get_payroll_data(year: int, month: int = None, store: str = None):
     if store is not None and store != "全体":
         query += " AND store_name = ?"
         params.append(store)
+    if not include_hq:
+        query += " AND store_name != ?"
+        params.append(HQ_STORE)
     query += " ORDER BY store_name, employee_id"
     rows = conn.execute(query, params).fetchall()
     conn.close()

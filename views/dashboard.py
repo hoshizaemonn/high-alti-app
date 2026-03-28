@@ -8,7 +8,7 @@ from database import (
     get_payroll_data, get_expense_data, get_revenue_data, get_member_data,
     get_available_years, get_available_months, get_member_summary_stats,
     get_monthly_summary,
-    STORES, EXPENSE_CATEGORIES,
+    STORES, HQ_STORE, EXPENSE_CATEGORIES,
 )
 
 
@@ -38,8 +38,9 @@ def _compute_payroll_summary(payroll_records: list[dict]) -> dict:
             "gross_total": 0, "base_salary": 0, "position_allowance": 0,
             "overtime_pay": 0, "commute_total": 0, "taxable_total": 0,
             "legal_welfare": 0, "total_labor_cost": 0,
-            "scheduled_hours": 0, "overtime_hours": 0,
+            "scheduled_hours": 0, "overtime_hours": 0, "total_hours": 0,
             "employee_count": 0, "fulltime_count": 0, "parttime_count": 0,
+            "fulltime_gross": 0, "parttime_gross": 0,
         }
 
     df = pd.DataFrame(payroll_records)
@@ -51,6 +52,7 @@ def _compute_payroll_summary(payroll_records: list[dict]) -> dict:
     taxable = df["taxable_total"].sum()
     sched_hours = df["scheduled_hours"].sum()
     ot_hours = df["overtime_hours"].sum()
+    total_hours = sched_hours + ot_hours
 
     welfare = (
         df["health_insurance_co"].sum()
@@ -67,6 +69,9 @@ def _compute_payroll_summary(payroll_records: list[dict]) -> dict:
     ft = df[df["contract_type"] == "正社員"]["employee_id"].nunique()
     pt = df[df["contract_type"] == "アルバイト"]["employee_id"].nunique()
 
+    ft_gross = df[df["contract_type"] == "正社員"]["gross_total"].sum()
+    pt_gross = df[df["contract_type"] == "アルバイト"]["gross_total"].sum()
+
     return {
         "gross_total": gross,
         "base_salary": base,
@@ -78,9 +83,12 @@ def _compute_payroll_summary(payroll_records: list[dict]) -> dict:
         "total_labor_cost": gross + welfare,
         "scheduled_hours": sched_hours,
         "overtime_hours": ot_hours,
+        "total_hours": total_hours,
         "employee_count": unique_emp,
         "fulltime_count": ft,
         "parttime_count": pt,
+        "fulltime_gross": ft_gross,
+        "parttime_gross": pt_gross,
     }
 
 
@@ -176,6 +184,16 @@ def _render_monthly(year: int, month: int, store: str):
     with k4:
         _kpi_card("営業利益", operating_profit)
 
+    # Sub-KPI row: payroll breakdown and total hours
+    if pay_sum["total_hours"] > 0 or pay_sum["fulltime_gross"] > 0:
+        sk1, sk2, sk3 = st.columns(3)
+        with sk1:
+            st.metric("正社員給与", _fmt(pay_sum["fulltime_gross"]))
+        with sk2:
+            st.metric("アルバイト給与", _fmt(pay_sum["parttime_gross"]))
+        with sk3:
+            st.metric("総勤務時間", f"{pay_sum['total_hours']:,.1f}h")
+
     # PL Table
     st.markdown("---")
     st.subheader("損益計算書（PL）")
@@ -195,6 +213,8 @@ def _render_monthly(year: int, month: int, store: str):
 
     # Labor cost section
     pl_rows.append({"科目": "【人件費】", "金額": "", "_bold": True})
+    pl_rows.append({"科目": "  正社員給与", "金額": _fmt(pay_sum["fulltime_gross"])})
+    pl_rows.append({"科目": "  アルバイト給与", "金額": _fmt(pay_sum["parttime_gross"])})
     pl_rows.append({"科目": "  基本給", "金額": _fmt(pay_sum["base_salary"])})
     pl_rows.append({"科目": "  役職手当", "金額": _fmt(pay_sum["position_allowance"])})
     pl_rows.append({"科目": "  残業手当", "金額": _fmt(pay_sum["overtime_pay"])})
@@ -204,6 +224,7 @@ def _render_monthly(year: int, month: int, store: str):
         pl_rows.append({"科目": "  その他手当", "金額": _fmt(other_pay)})
     pl_rows.append({"科目": "  支給合計", "金額": _fmt(pay_sum["gross_total"]), "_bold": True})
     pl_rows.append({"科目": "  法定福利費（会社負担）", "金額": _fmt(pay_sum["legal_welfare"])})
+    pl_rows.append({"科目": "  総勤務時間", "金額": f"{pay_sum['total_hours']:,.1f}h"})
     pl_rows.append({"科目": "人件費合計", "金額": _fmt(total_labor), "_bold": True})
 
     pl_rows.append({"科目": "", "金額": ""})
@@ -510,6 +531,9 @@ def _render_annual(year: int, store: str):
             "expense": total_expense,
             "operating_profit": total_rev - total_labor - total_expense,
             "gross_total": pay_sum["gross_total"],
+            "fulltime_gross": pay_sum["fulltime_gross"],
+            "parttime_gross": pay_sum["parttime_gross"],
+            "total_hours": pay_sum["total_hours"],
             "legal_welfare": pay_sum["legal_welfare"],
             "member_count": rev_sum["member_count"],
             "member_count_ml": mem_sum["total"],
@@ -880,8 +904,9 @@ def _render_annual(year: int, store: str):
 
     table_data = {
         "科目": [
-            "売上高", "人件費（支給合計）", "法定福利費",
-            "人件費合計", "経費合計",
+            "売上高", "正社員給与", "アルバイト給与",
+            "人件費（支給合計）", "法定福利費",
+            "人件費合計", "総勤務時間", "経費合計",
         ] + [cat for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
             "営業利益",
         ],
@@ -890,25 +915,34 @@ def _render_annual(year: int, store: str):
     for _, row in df.iterrows():
         m_label = row["month_label"]
         vals = [
-            row["revenue"], row["gross_total"], row["legal_welfare"],
-            row["labor_cost"], row["expense"],
-        ] + [row[f"exp_{cat}"] for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
+            row["revenue"], row["fulltime_gross"], row["parttime_gross"],
+            row["gross_total"], row["legal_welfare"],
+            row["labor_cost"],
+        ]
+        # total_hours formatted differently (not yen)
+        hours_str = f"{row['total_hours']:,.1f}h" if row["total_hours"] > 0 else "-"
+        remaining_vals = [row["expense"]] + [row[f"exp_{cat}"] for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
             row["operating_profit"],
         ]
-        table_data[m_label] = [_fmt(v) for v in vals]
+        table_data[m_label] = [_fmt(v) for v in vals] + [hours_str] + [_fmt(v) for v in remaining_vals]
 
     # Annual total and average
     n_data_months = len(has_data) if len(has_data) > 0 else 1
-    total_vals = [
-        ann_rev, df["gross_total"].sum(), df["legal_welfare"].sum(),
-        ann_labor, ann_exp,
-    ] + [df[f"exp_{cat}"].sum() for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
+    total_vals_pre = [
+        ann_rev, df["fulltime_gross"].sum(), df["parttime_gross"].sum(),
+        df["gross_total"].sum(), df["legal_welfare"].sum(),
+        ann_labor,
+    ]
+    total_hours = df["total_hours"].sum()
+    total_vals_post = [ann_exp] + [df[f"exp_{cat}"].sum() for cat in EXPENSE_CATEGORIES if df[f"exp_{cat}"].sum() > 0] + [
         ann_profit,
     ]
-    avg_vals = [v / n_data_months for v in total_vals]
+    avg_vals_pre = [v / n_data_months for v in total_vals_pre]
+    avg_hours = total_hours / n_data_months
+    avg_vals_post = [v / n_data_months for v in total_vals_post]
 
-    table_data["年間合計"] = [_fmt(v) for v in total_vals]
-    table_data["月平均"] = [_fmt(v) for v in avg_vals]
+    table_data["年間合計"] = [_fmt(v) for v in total_vals_pre] + [f"{total_hours:,.1f}h"] + [_fmt(v) for v in total_vals_post]
+    table_data["月平均"] = [_fmt(v) for v in avg_vals_pre] + [f"{avg_hours:,.1f}h"] + [_fmt(v) for v in avg_vals_post]
 
     df_table = pd.DataFrame(table_data)
     st.dataframe(df_table, use_container_width=True, hide_index=True)

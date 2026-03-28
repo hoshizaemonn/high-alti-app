@@ -6,8 +6,11 @@ from database import (
     get_all_overrides, upsert_override, delete_override,
     get_all_expense_rules, upsert_expense_rule, delete_expense_rule,
     get_connection,
-    STORES, EXPENSE_CATEGORIES,
+    STORES, HQ_STORE, EXPENSE_CATEGORIES,
 )
+
+# Store options including HQ for employee mapping
+STORE_OPTIONS_WITH_HQ = STORES + [HQ_STORE]
 
 
 def _get_employee_names() -> dict:
@@ -57,7 +60,7 @@ def render():
                 column_config={
                     "従業員番号": st.column_config.NumberColumn("従業員番号", disabled=True),
                     "氏名": st.column_config.TextColumn("氏名", disabled=True),
-                    "店舗": st.column_config.SelectboxColumn("店舗", options=STORES, required=True),
+                    "店舗": st.column_config.SelectboxColumn("店舗", options=STORE_OPTIONS_WITH_HQ, required=True),
                     "比率(%)": st.column_config.NumberColumn("比率(%)", min_value=1, max_value=100),
                     "削除": st.column_config.CheckboxColumn("削除", default=False),
                 },
@@ -111,7 +114,7 @@ def render():
         with add_col2:
             new_emp_name = st.text_input("氏名", key="new_override_name")
         with add_col3:
-            new_store = st.selectbox("店舗", STORES, key="new_override_store")
+            new_store = st.selectbox("店舗", STORE_OPTIONS_WITH_HQ, key="new_override_store")
         with add_col4:
             new_ratio = st.number_input("比率(%)", min_value=1, max_value=100, value=100, key="new_override_ratio")
         with add_col5:
@@ -146,11 +149,11 @@ def render():
             with dual_col2:
                 # Exclude stores already assigned
                 current_stores = [r["store_name"] for r in existing_emps[dual_emp_id]["records"]]
-                available_stores = [s for s in STORES if s not in current_stores]
+                available_stores = [s for s in STORE_OPTIONS_WITH_HQ if s not in current_stores]
                 if available_stores:
                     dual_store2 = st.selectbox("追加する店舗", available_stores, key="dual_store2")
                 else:
-                    dual_store2 = st.selectbox("追加する店舗", STORES, key="dual_store2")
+                    dual_store2 = st.selectbox("追加する店舗", STORE_OPTIONS_WITH_HQ, key="dual_store2")
                     st.caption("※ 全店舗に既に登録済みです")
             with dual_col3:
                 dual_ratio2 = st.number_input("新しい店舗の比率(%)", min_value=1, max_value=99, value=40, key="dual_ratio2")

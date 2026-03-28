@@ -10,8 +10,11 @@ from datetime import datetime, date
 from database import (
     save_payroll_data, save_expense_data, save_revenue_data,
     save_member_data, save_monthly_summary,
-    upsert_override, STORES, EXPENSE_CATEGORIES,
+    upsert_override, STORES, HQ_STORE, EXPENSE_CATEGORIES,
 )
+
+# Store options including HQ for employee assignment
+STORE_OPTIONS_WITH_HQ = STORES + [HQ_STORE]
 from store_logic import resolve_store, apply_ratio
 from expense_logic import classify_expense
 
@@ -603,7 +606,7 @@ def render():
                             with assign_col1:
                                 selected_store = st.selectbox(
                                     f"店舗 — {emp['employee_name']}",
-                                    STORES,
+                                    STORE_OPTIONS_WITH_HQ,
                                     key=f"assign_{emp['employee_id']}",
                                     label_visibility="collapsed",
                                 )
