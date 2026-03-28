@@ -44,7 +44,7 @@ def _parse_date_loose(val: str) -> date | None:
     if not val or not val.strip():
         return None
     val = val.strip()
-    for fmt in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
         try:
             return datetime.strptime(val, fmt).date()
         except ValueError:

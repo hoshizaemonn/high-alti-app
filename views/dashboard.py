@@ -652,12 +652,16 @@ def _render_annual(year: int, store: str):
                 )
                 st.plotly_chart(fig_pie, use_container_width=True, key=f"chart_pie_{year}_{store}")
 
-    # MA002 Monthly Summary charts (preferred when available)
+    # ===== 会員データ（MA002 + ML001 統合セクション）=====
     has_ma_data = any(row["has_ma"] for row in monthly_data)
-    if has_ma_data:
-        st.markdown("---")
-        st.subheader("会員推移（MA002 月次サマリ）")
+    has_member_data_ml = any(row["member_count_ml"] > 0 for row in monthly_data)
 
+    if has_ma_data or has_member_data_ml:
+        st.markdown("---")
+        from datetime import datetime as _dt
+        st.subheader(f"会員データ（{_dt.now().strftime('%Y年%-m月%-d日')}現在）")
+
+    if has_ma_data:
         # MA002 trend charts
         ma_months = [row["month_label"] for row in monthly_data if row["has_ma"]]
         ma_total = [row["ma_total_members"] for row in monthly_data if row["has_ma"]]
@@ -739,12 +743,8 @@ def _render_annual(year: int, store: str):
                     )
                     st.plotly_chart(fig_ma_rate, use_container_width=True, key=f"chart_ma_rate_{year}_{store}")
 
-    # Member data charts (from ML001)
-    has_member_data = any(row["member_count_ml"] > 0 for row in monthly_data)
-    if has_member_data:
-        st.markdown("---")
-        from datetime import datetime as _dt
-        st.subheader(f"会員データ（{_dt.now().strftime('%Y年%-m月%-d日')}現在）")
+    # ML001 member detail (continues within the same section)
+    if has_member_data_ml:
 
         # Find latest month with data for snapshot
         latest_member_month = None
