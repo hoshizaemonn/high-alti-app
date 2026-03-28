@@ -320,38 +320,41 @@ def _render_monthly(year: int, month: int, store: str):
         else:
             ma_cancel_rate = f"{ma_cancellations / ma_plan_subscribers * 100:.1f}%" if ma_plan_subscribers > 0 else "-"
 
-        st.markdown("---")
-        st.subheader("会員情報（MA002 月次サマリ）")
+        # ML001から体験数を取得
+        ma_trial_count = mem_sum.get("trial", 0)
 
-        mk1, mk2, mk3 = st.columns(3)
+        st.markdown("---")
+        st.subheader("会員情報")
+
+        mk1, mk2, mk3, mk4 = st.columns(4)
         with mk1:
             st.metric("在籍会員数", f"{ma_total_members}名")
         with mk2:
             st.metric("プラン契約者数", f"{ma_plan_subscribers}名")
         with mk3:
+            st.metric("新規会員登録", f"{ma_new_registrations}名")
+        with mk4:
             st.metric("退会率", ma_cancel_rate)
 
-        mk4, mk5, mk6, mk7 = st.columns(4)
-        with mk4:
-            st.metric("新規入会", f"{ma_new_signups}名")
+        mk5, mk6, mk7, mk8, mk9 = st.columns(5)
         with mk5:
-            st.metric("退会", f"{ma_cancellations}名")
+            st.metric("新規入会", f"{ma_new_signups}名")
         with mk6:
-            st.metric("休会", f"{ma_suspensions}名")
+            st.metric("新規申込", f"{ma_new_applications}名")
         with mk7:
-            st.metric("新規会員登録", f"{ma_new_registrations}名")
+            st.metric("退会", f"{ma_cancellations}名")
+        with mk8:
+            st.metric("休会", f"{ma_suspensions}名")
+        with mk9:
+            st.metric("プラン変更", f"{ma_plan_changes}名")
 
-        # Additional details in expander
-        with st.expander("MA002 詳細", expanded=False):
-            detail_data = pd.DataFrame([{
-                "新規申込数": ma_new_applications,
-                "プラン変更数": ma_plan_changes,
-            }])
-            st.dataframe(detail_data, use_container_width=True, hide_index=True)
+        # 体験数（ML001から）
+        if ma_trial_count > 0:
+            st.metric("体験", f"{ma_trial_count}名")
 
-            # Per-store breakdown if multiple records
-            if len(ma_records) > 1:
-                st.markdown("**店舗別**")
+        # Per-store breakdown if multiple records
+        if len(ma_records) > 1:
+            with st.expander("店舗別内訳", expanded=False):
                 store_rows = []
                 for r in ma_records:
                     store_rows.append({
