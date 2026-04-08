@@ -1,0 +1,6 @@
+data/*.db
+data/*.sqlite
+__pycache__/
+*.pyc
+.streamlit/
+.env
