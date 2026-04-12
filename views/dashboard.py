@@ -507,7 +507,6 @@ def _render_monthly(year: int, month: int, store: str, show_payroll_detail: bool
                 actual = _compute_actual(item, year, month, store)
                 diff = actual - budget
                 ratio = (actual / budget * 100) if budget != 0 else 0
-                # Skip rows with both 0
                 if budget == 0 and actual == 0:
                     continue
                 rows.append({
@@ -516,10 +515,113 @@ def _render_monthly(year: int, month: int, store: str, show_payroll_detail: bool
                     "実績": f"¥{actual:,.0f}",
                     "予算差": f"¥{diff:,.0f}",
                     "予算比": f"{ratio:.1f}%",
+                    "_budget": budget,
+                    "_actual": actual,
+                    "_diff": diff,
+                    "_ratio": ratio,
                 })
 
             if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                # ── 達成率KPI ──
+                # Aggregate: revenue items, labor items, expense items
+                rev_items = ["月会費収入", "パーソナル・物販・その他収入", "サービス収入", "自販機手数料収入"]
+                labor_items = ["正社員・契約社員給与", "賞与", "通勤手当", "法定福利費"]
+                rev_budget = sum(r["_budget"] for r in rows if r["科目"] in rev_items)
+                rev_actual = sum(r["_actual"] for r in rows if r["科目"] in rev_items)
+                labor_budget = sum(r["_budget"] for r in rows if r["科目"] in labor_items)
+                labor_actual = sum(r["_actual"] for r in rows if r["科目"] in labor_items)
+                exp_budget = sum(r["_budget"] for r in rows if r["科目"] not in rev_items and r["科目"] not in labor_items)
+                exp_actual = sum(r["_actual"] for r in rows if r["科目"] not in rev_items and r["科目"] not in labor_items)
+                profit_budget = rev_budget - labor_budget - exp_budget
+                profit_actual = rev_actual - labor_actual - exp_actual
+
+                bg1, bg2, bg3, bg4 = st.columns(4)
+                with bg1:
+                    r_pct = rev_actual / rev_budget * 100 if rev_budget else 0
+                    delta_str = f"{r_pct:.0f}%" if rev_budget else "-"
+                    st.metric("売上 達成率", delta_str,
+                              delta=f"¥{rev_actual - rev_budget:+,.0f}" if rev_budget else None)
+                with bg2:
+                    l_pct = labor_actual / labor_budget * 100 if labor_budget else 0
+                    st.metric("人件費 予算比", f"{l_pct:.0f}%" if labor_budget else "-",
+                              delta=f"¥{labor_actual - labor_budget:+,.0f}" if labor_budget else None,
+                              delta_color="inverse")
+                with bg3:
+                    e_pct = exp_actual / exp_budget * 100 if exp_budget else 0
+                    st.metric("経費 予算比", f"{e_pct:.0f}%" if exp_budget else "-",
+                              delta=f"¥{exp_actual - exp_budget:+,.0f}" if exp_budget else None,
+                              delta_color="inverse")
+                with bg4:
+                    p_diff = profit_actual - profit_budget
+                    st.metric("営業利益 予算差", f"¥{p_diff:+,.0f}" if profit_budget else "-",
+                              delta=f"予算¥{profit_budget:,.0f}" if profit_budget else None,
+                              delta_color="off")
+
+                # ── 予算vs実績 横棒グラフ ──
+                chart_rows = [r for r in rows if r["_budget"] != 0 or r["_actual"] != 0]
+                if chart_rows:
+                    fig_ba = go.Figure()
+                    fig_ba.add_trace(go.Bar(
+                        y=[r["科目"] for r in chart_rows],
+                        x=[r["_budget"] for r in chart_rows],
+                        name="予算", orientation="h",
+                        marker_color="#B0BEC5",
+                    ))
+                    fig_ba.add_trace(go.Bar(
+                        y=[r["科目"] for r in chart_rows],
+                        x=[r["_actual"] for r in chart_rows],
+                        name="実績", orientation="h",
+                        marker_color=["#4CAF50" if r["科目"] in rev_items else "#F44336" for r in chart_rows],
+                    ))
+                    fig_ba.update_layout(
+                        barmode="group",
+                        title=f"{year}年{month}月 予算 vs 実績",
+                        xaxis_title="金額（円）",
+                        height=max(350, len(chart_rows) * 35),
+                        margin=dict(l=20, r=20, t=40, b=20),
+                        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, font=dict(size=11)),
+                    )
+                    st.plotly_chart(fig_ba, use_container_width=True, key=f"chart_ba_{year}_{month}_{store}")
+
+                # ── 表（カテゴリ付き・色分け） ──
+                display_rows = []
+                for r in rows:
+                    if r["科目"] in rev_items:
+                        cat = "売上系"
+                    elif r["科目"] in labor_items:
+                        cat = "人件費系"
+                    else:
+                        cat = "経費系"
+                    display_rows.append({
+                        "カテゴリ": cat,
+                        "科目": r["科目"],
+                        "予算": r["予算"],
+                        "実績": r["実績"],
+                        "予算差": r["予算差"],
+                        "予算比": r["予算比"],
+                    })
+                df_ba = pd.DataFrame(display_rows)
+
+                def _style_budget_row(row):
+                    """Color budget diff/ratio: green=good, red=bad."""
+                    styles = [""] * len(row)
+                    cat = row["カテゴリ"]
+                    diff_str = row["予算差"].replace("¥", "").replace(",", "").replace("+", "")
+                    try:
+                        diff_val = float(diff_str)
+                    except ValueError:
+                        return styles
+                    # For revenue: positive diff = good. For expense/labor: negative diff = good
+                    if cat == "売上系":
+                        color = "color: #2E7D32" if diff_val >= 0 else "color: #C62828"
+                    else:
+                        color = "color: #2E7D32" if diff_val <= 0 else "color: #C62828"
+                    styles[4] = color  # 予算差
+                    styles[5] = color  # 予算比
+                    return styles
+
+                styled = df_ba.style.apply(_style_budget_row, axis=1)
+                st.dataframe(styled, use_container_width=True, hide_index=True)
             else:
                 st.info("表示できるデータがありません。")
 
@@ -642,28 +744,36 @@ def _render_monthly(year: int, month: int, store: str, show_payroll_detail: bool
         st.markdown("---")
         st.subheader("会員情報")
 
-        mk1, mk2, mk3, mk4 = st.columns(4)
-        with mk1:
-            st.metric("在籍会員数", f"{ma_total_members}名")
-        with mk2:
-            st.metric("プラン契約者数", f"{ma_plan_subscribers}名")
-        with mk3:
-            st.metric("新規会員登録", f"{ma_new_registrations}名")
-        with mk4:
-            st.metric("退会率", ma_cancel_rate)
+        if store == "全体":
+            # 全体ビュー: 在籍会員数をメインに
+            mk1, mk2, mk3, mk4 = st.columns(4)
+            with mk1:
+                st.metric("在籍会員数", f"{ma_total_members}名")
+            with mk2:
+                st.metric("プラン契約者数", f"{ma_plan_subscribers}名")
+            with mk3:
+                st.metric("新規入会", f"{ma_new_signups}名")
+            with mk4:
+                st.metric("退会率", ma_cancel_rate)
+        else:
+            # 店舗ビュー: プラン契約者数をメインに（在籍は全社数値なので非表示）
+            mk1, mk2, mk3, mk4 = st.columns(4)
+            with mk1:
+                st.metric("プラン契約者数", f"{ma_plan_subscribers}名")
+            with mk2:
+                st.metric("新規入会", f"{ma_new_signups}名")
+            with mk3:
+                st.metric("退会率", ma_cancel_rate)
+            with mk4:
+                st.metric("プラン変更", f"{ma_plan_changes}名")
 
-        mk5, mk6, mk7, mk8, mk9 = st.columns(5)
+        mk5, mk6, mk7 = st.columns(3)
         with mk5:
-            st.metric("新規入会", f"{ma_new_signups}名")
-        with mk6:
             st.metric("新規申込", f"{ma_new_applications}名")
-        with mk7:
+        with mk6:
             st.metric("退会", f"{ma_cancellations}名")
-        with mk8:
+        with mk7:
             st.metric("休会", f"{ma_suspensions}名")
-        with mk9:
-            st.metric("プラン変更", f"{ma_plan_changes}名")
-
         # 体験数（ML001から）
         if ma_trial_count > 0:
             st.metric("体験", f"{ma_trial_count}名")
@@ -720,32 +830,26 @@ def _render_monthly(year: int, month: int, store: str, show_payroll_detail: bool
                     })
                 st.dataframe(pd.DataFrame(store_rows), use_container_width=True, hide_index=True)
 
-        # Still show ML001 plan breakdown if available
-        if mem_sum["total"] > 0:
-            mc1, mc2 = st.columns(2)
-            with mc1:
-                st.markdown("**プラン別会員数（有効在籍 — ML001）**")
-                if mem_sum["active_by_plan"]:
-                    plan_data = sorted(mem_sum["active_by_plan"].items(), key=lambda x: -x[1])
-                    plan_df = pd.DataFrame(plan_data, columns=["プラン名", "会員数"])
-                    total_active = sum(v for _, v in plan_data)
-                    plan_df["構成比"] = plan_df["会員数"].apply(
-                        lambda x: f"{x / total_active * 100:.1f}%" if total_active > 0 else "0%"
-                    )
-                    st.dataframe(plan_df, use_container_width=True, hide_index=True, key=f"plan_tbl_{year}_{month}_{store}")
-
-            with mc2:
-                if mem_sum["active_by_plan"]:
-                    fig_plan = go.Figure(data=[go.Pie(
-                        labels=list(mem_sum["active_by_plan"].keys()),
-                        values=list(mem_sum["active_by_plan"].values()),
-                        hole=0.4,
-                    )])
-                    fig_plan.update_layout(
-                        title="プラン構成比（有効在籍）", height=350,
-                        margin=dict(l=20, r=20, t=40, b=20),
-                    )
-                    st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_pie_{year}_{month}_{store}")
+        # Plan breakdown horizontal bar chart (ML001)
+        if mem_sum["total"] > 0 and mem_sum.get("active_by_plan"):
+            plan_data = mem_sum["active_by_plan"]
+            plans_sorted = sorted(plan_data.items(), key=lambda x: x[1])
+            fig_plan = go.Figure()
+            fig_plan.add_trace(go.Bar(
+                y=[p[0] for p in plans_sorted],
+                x=[p[1] for p in plans_sorted],
+                orientation="h",
+                marker_color="#4CAF50",
+                text=[p[1] for p in plans_sorted],
+                textposition="auto",
+            ))
+            fig_plan.update_layout(
+                title=f"プラン別会員数（{month}月）",
+                xaxis_title="会員数", yaxis_title="",
+                height=max(300, len(plans_sorted) * 28),
+                margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_bar_{year}_{month}_{store}")
 
     elif mem_sum["total"] > 0:
         # Fallback: no MA002 data, use ML001 computed stats (original behavior)
@@ -813,18 +917,71 @@ def _render_monthly(year: int, month: int, store: str, show_payroll_detail: bool
                 st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_pie_{year}_{month}_{store}")
 
 
-def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
-    """Render annual PL view with charts."""
-    available_months = get_available_months(year)
+def _render_half_year(year: int, half: str, store: str, show_payroll_detail: bool = True):
+    """Render half-year PL view. half is '上期' (1-6) or '下期' (7-12)."""
+    if half == "上期":
+        months = range(1, 7)
+        label = f"{year}年 上期（1〜6月）"
+    else:
+        months = range(7, 13)
+        label = f"{year}年 下期（7〜12月）"
+    _render_annual(year, store, show_payroll_detail=show_payroll_detail,
+                   month_range=months, period_label=label)
+
+
+def _render_fiscal_year(end_year: int, store: str, show_payroll_detail: bool = True):
+    """Render fiscal year (10月〜9月) PL view.
+
+    end_year is the year the fiscal period ends (e.g. 2026 for 2025/10〜2026/9).
+    Data is fetched from two calendar years.
+    """
+    # Build (year, month) pairs: Oct(prev_year) to Sep(end_year)
+    prev_year = end_year - 1
+    fiscal_months = [(prev_year, m) for m in range(10, 13)] + [(end_year, m) for m in range(1, 10)]
+    label = f"{end_year}/9期（{prev_year}年10月〜{end_year}年9月）"
+
+    _render_annual_multi(fiscal_months, store, show_payroll_detail=show_payroll_detail,
+                         period_label=label)
+
+
+def _render_annual_multi(year_month_pairs: list, store: str, show_payroll_detail: bool = True,
+                         period_label: str = ""):
+    """Render multi-month PL view for fiscal year (跨年対応)."""
+    month_range = range(len(year_month_pairs))  # dummy for downstream len() checks
+    _render_annual(year_month_pairs[0][0], store, show_payroll_detail=show_payroll_detail,
+                   month_range=month_range, period_label=period_label,
+                   year_month_pairs=year_month_pairs)
+
+
+def _render_annual(year: int, store: str, show_payroll_detail: bool = True,
+                   month_range=None, period_label: str = "",
+                   year_month_pairs: list = None):
+    """Render annual PL view with charts. month_range can limit to a subset.
+
+    If year_month_pairs is provided (list of (year, month) tuples), it takes
+    precedence over month_range for data fetching (fiscal year support).
+    """
+    if month_range is None:
+        month_range = range(1, 13)
+    if not period_label:
+        period_label = f"{year}年 年間 — {store}"
+    else:
+        period_label = f"{period_label} — {store}"
+
+    # Build iteration list: either year_month_pairs or (year, m) from month_range
+    if year_month_pairs:
+        ym_list = year_month_pairs
+    else:
+        ym_list = [(year, m) for m in month_range]
 
     monthly_data = []
-    for m in range(1, 13):
-        payroll = get_payroll_data(year, m, store)
-        expenses = get_expense_data(year, m, store)
-        revenue = get_revenue_data(year, m, store)
-        sales_detail = get_sales_detail(year, m, store)
-        members = get_member_data(year, m, store)
-        ma_records = get_monthly_summary(year, m, store)
+    for data_year, m in ym_list:
+        payroll = get_payroll_data(data_year, m, store)
+        expenses = get_expense_data(data_year, m, store)
+        revenue = get_revenue_data(data_year, m, store)
+        sales_detail = get_sales_detail(data_year, m, store)
+        members = get_member_data(data_year, m, store)
+        ma_records = get_monthly_summary(data_year, m, store)
 
         pay_sum = _compute_payroll_summary(payroll)
         exp_sum = _compute_expense_summary(expenses)
@@ -905,16 +1062,17 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
     ann_exp = df["expense"].sum()
     ann_profit = ann_rev - ann_labor - ann_exp
 
-    st.markdown(f"### {year}年 年間 — {store}")
+    period_short = "年間" if len(list(month_range)) == 12 else "期間"
+    st.markdown(f"### {period_label}")
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        _kpi_card("売上合計（年間）", ann_rev)
+        _kpi_card(f"売上合計（{period_short}）", ann_rev)
     with k2:
-        _kpi_card("人件費合計（年間）", ann_labor, inverse=True)
+        _kpi_card(f"人件費合計（{period_short}）", ann_labor, inverse=True)
     with k3:
-        _kpi_card("経費合計（年間）", ann_exp, inverse=True)
+        _kpi_card(f"経費合計（{period_short}）", ann_exp, inverse=True)
     with k4:
-        _kpi_card("営業利益（年間）", ann_profit)
+        _kpi_card(f"営業利益（{period_short}）", ann_profit)
 
     if has_data.empty:
         st.info("表示するデータがありません。データをアップロードしてください。")
@@ -954,18 +1112,37 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
         st.plotly_chart(fig_rev, use_container_width=True, key=f"chart_rev_{year}_{store}")
 
     with c2:
-        # Member count trend (MA002 plan subscribers)
         fig_mem = go.Figure()
-        fig_mem.add_trace(go.Scatter(
-            x=df["month_label"], y=df["ma_plan_subscribers"],
-            mode="lines+markers", name="プラン契約者数",
-            line=dict(color="#4CAF50", width=3),
-            marker=dict(size=8),
-        ))
-        fig_mem.update_layout(
-            title="プラン契約者数推移", xaxis_title="月", yaxis_title="人数",
-            height=350, margin=dict(l=20, r=20, t=40, b=20),
-        )
+        if store == "全体":
+            # 全体: 在籍会員数を表示
+            fig_mem.add_trace(go.Scatter(
+                x=df["month_label"], y=df["ma_total_members"],
+                mode="lines+markers", name="在籍会員数",
+                line=dict(color="#2196F3", width=3),
+                marker=dict(size=8),
+            ))
+            fig_mem.add_trace(go.Scatter(
+                x=df["month_label"], y=df["ma_plan_subscribers"],
+                mode="lines+markers", name="プラン契約者数",
+                line=dict(color="#4CAF50", width=3),
+                marker=dict(size=8),
+            ))
+            fig_mem.update_layout(
+                title="在籍会員数推移", xaxis_title="月", yaxis_title="人数",
+                height=350, margin=dict(l=20, r=20, t=40, b=20),
+            )
+        else:
+            # 店舗: プラン契約者数のみ
+            fig_mem.add_trace(go.Scatter(
+                x=df["month_label"], y=df["ma_plan_subscribers"],
+                mode="lines+markers", name="プラン契約者数",
+                line=dict(color="#4CAF50", width=3),
+                marker=dict(size=8),
+            ))
+            fig_mem.update_layout(
+                title="プラン契約者数推移", xaxis_title="月", yaxis_title="人数",
+                height=350, margin=dict(l=20, r=20, t=40, b=20),
+            )
         st.plotly_chart(fig_mem, use_container_width=True, key=f"chart_mem_{year}_{store}")
 
     c3, c4 = st.columns(2)
@@ -990,29 +1167,44 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
         st.plotly_chart(fig_rl, use_container_width=True, key=f"chart_rl_{year}_{store}")
 
     with c4:
-        # Store comparison (operating profit) — only meaningful for 全体
         if store == "全体":
-            store_profits = {}
+            # Compute store data for comparison (reused below)
+            _store_compare_data = {}
             for s in STORES:
-                s_payroll = get_payroll_data(year, store=s)
-                s_expenses = get_expense_data(year, store=s)
-                s_rev = get_revenue_data(year, store=s)
-                s_pay_sum = _compute_payroll_summary(s_payroll)
-                s_exp_sum = _compute_expense_summary(s_expenses)
-                s_rev_sum = _compute_revenue_summary(s_rev)
-                profit = s_rev_sum["total"] - s_pay_sum["total_labor_cost"] - s_exp_sum["total"]
-                store_profits[s] = profit
+                s_rev_total = 0
+                s_labor_total = 0
+                s_exp_total = 0
+                for dy, dm in ym_list:
+                    s_payroll = get_payroll_data(dy, dm, s)
+                    s_expenses = get_expense_data(dy, dm, s)
+                    s_sd = get_sales_detail(dy, dm, s)
+                    s_rev = get_revenue_data(dy, dm, s)
+                    s_pay_sum = _compute_payroll_summary(s_payroll)
+                    s_exp_sum = _compute_expense_summary(s_expenses)
+                    s_sd_sum = _compute_sales_detail_summary(s_sd)
+                    s_rev_sum = _compute_revenue_summary(s_rev)
+                    has_sd = s_sd_sum["total"] != 0 or s_sd_sum["count"] > 0
+                    s_rev_total += s_sd_sum["total"] if has_sd else s_rev_sum["total"]
+                    s_labor_total += s_pay_sum["total_labor_cost"]
+                    s_exp_total += s_exp_sum["total"]
+                _store_compare_data[s] = {
+                    "revenue": s_rev_total,
+                    "labor": s_labor_total,
+                    "expense": s_exp_total,
+                    "profit": s_rev_total - s_labor_total - s_exp_total,
+                }
 
+            # Show operating profit inside c4
+            profits = {s: d["profit"] for s, d in _store_compare_data.items()}
+            colors = ["#F44336" if v < 0 else "#4CAF50" for v in profits.values()]
             fig_store = go.Figure()
-            colors = ["#F44336" if v < 0 else "#4CAF50" for v in store_profits.values()]
             fig_store.add_trace(go.Bar(
-                x=list(store_profits.keys()),
-                y=list(store_profits.values()),
+                x=list(profits.keys()), y=list(profits.values()),
                 marker_color=colors,
+                text=[f"¥{v:,.0f}" for v in profits.values()], textposition="auto",
             ))
             fig_store.update_layout(
-                title="店舗別 営業利益",
-                xaxis_title="店舗", yaxis_title="営業利益（円）",
+                title="店舗別 営業利益", xaxis_title="店舗", yaxis_title="円",
                 height=350, margin=dict(l=20, r=20, t=40, b=20),
             )
             st.plotly_chart(fig_store, use_container_width=True, key=f"chart_store_{year}_{store}")
@@ -1030,6 +1222,103 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
                     margin=dict(l=20, r=20, t=40, b=20),
                 )
                 st.plotly_chart(fig_pie, use_container_width=True, key=f"chart_pie_{year}_{store}")
+
+    # ===== Store comparison charts (outside c3/c4, full width) =====
+    _store_compare_data_exists = False
+    try:
+        _store_compare_data_exists = bool(_store_compare_data)
+    except NameError:
+        pass
+    if store == "全体" and _store_compare_data_exists:
+        store_data = _store_compare_data
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            fig_rev_store = go.Figure()
+            fig_rev_store.add_trace(go.Bar(
+                x=list(store_data.keys()),
+                y=[d["revenue"] for d in store_data.values()],
+                marker_color="#2196F3",
+                text=[f"¥{d['revenue']:,.0f}" for d in store_data.values()],
+                textposition="auto",
+            ))
+            fig_rev_store.update_layout(
+                title="店舗別 売上", xaxis_title="店舗", yaxis_title="円",
+                height=350, margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(fig_rev_store, use_container_width=True, key=f"chart_store_rev_{year}_{store}")
+
+        with sc2:
+            fig_lab_store = go.Figure()
+            fig_lab_store.add_trace(go.Bar(
+                x=list(store_data.keys()),
+                y=[d["labor"] for d in store_data.values()],
+                marker_color="#F44336",
+                text=[f"¥{d['labor']:,.0f}" for d in store_data.values()],
+                textposition="auto",
+            ))
+            fig_lab_store.update_layout(
+                title="店舗別 人件費", xaxis_title="店舗", yaxis_title="円",
+                height=350, margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(fig_lab_store, use_container_width=True, key=f"chart_store_lab_{year}_{store}")
+
+        sc3, sc4 = st.columns(2)
+        with sc3:
+            store_plan_subs = {}
+            for s in STORES:
+                latest_plan = 0
+                for dy, dm in reversed(ym_list):
+                    ma = get_monthly_summary(dy, dm, s)
+                    if ma:
+                        latest_plan = sum(r["plan_subscribers"] for r in ma)
+                        break
+                store_plan_subs[s] = latest_plan
+
+            if any(v > 0 for v in store_plan_subs.values()):
+                fig_plan_store = go.Figure()
+                fig_plan_store.add_trace(go.Bar(
+                    x=list(store_plan_subs.keys()),
+                    y=list(store_plan_subs.values()),
+                    marker_color="#4CAF50",
+                    text=[str(v) for v in store_plan_subs.values()],
+                    textposition="auto",
+                ))
+                fig_plan_store.update_layout(
+                    title="店舗別 プラン契約者数", xaxis_title="店舗", yaxis_title="人数",
+                    height=350, margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_plan_store, use_container_width=True, key=f"chart_store_plan_{year}_{store}")
+
+        with sc4:
+            store_cancel_rates = {}
+            for s in STORES:
+                latest_rate = 0
+                for dy, dm in reversed(ym_list):
+                    ma = get_monthly_summary(dy, dm, s)
+                    if ma:
+                        rate_str = ma[0]["cancellation_rate"]
+                        try:
+                            latest_rate = float(rate_str.replace("%", ""))
+                        except (ValueError, TypeError):
+                            latest_rate = 0
+                        break
+                store_cancel_rates[s] = latest_rate
+
+            if any(v > 0 for v in store_cancel_rates.values()):
+                fig_cancel_store = go.Figure()
+                fig_cancel_store.add_trace(go.Bar(
+                    x=list(store_cancel_rates.keys()),
+                    y=list(store_cancel_rates.values()),
+                    marker_color=["#F44336" if v > 5 else "#FF9800" if v > 3 else "#4CAF50" for v in store_cancel_rates.values()],
+                    text=[f"{v:.1f}%" for v in store_cancel_rates.values()],
+                    textposition="auto",
+                ))
+                fig_cancel_store.update_layout(
+                    title="店舗別 退会率", xaxis_title="店舗", yaxis_title="%",
+                    height=350, margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig_cancel_store, use_container_width=True, key=f"chart_store_cancel_{year}_{store}")
 
     # ===== 会員データ（MA002 + ML001 統合セクション）=====
     has_ma_data = any(row["has_ma"] for row in monthly_data)
@@ -1077,11 +1366,6 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
             with mac2:
                 fig_ma_churn = go.Figure()
                 fig_ma_churn.add_trace(go.Bar(
-                    x=ma_months, y=ma_new_reg,
-                    name="新規会員登録", marker_color="#2196F3",
-                    text=ma_new_reg, textposition="auto",
-                ))
-                fig_ma_churn.add_trace(go.Bar(
                     x=ma_months, y=ma_new,
                     name="新規入会", marker_color="#4CAF50",
                     text=ma_new, textposition="auto",
@@ -1097,7 +1381,7 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
                     text=ma_susp, textposition="auto",
                 ))
                 fig_ma_churn.update_layout(
-                    title="新規登録 / 入会 / 退会 / 休会推移", xaxis_title="月", yaxis_title="人数",
+                    title="新規入会 / 退会 / 休会推移", xaxis_title="月", yaxis_title="人数",
                     barmode="group",
                     height=380, margin=dict(l=20, r=20, t=40, b=20),
                 )
@@ -1122,62 +1406,18 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
                     )
                     st.plotly_chart(fig_ma_rate, use_container_width=True, key=f"chart_ma_rate_{year}_{store}")
 
-    # ML001 member detail (continues within the same section)
+    # ML001 — プラン別会員数のみ表示（その他のML001グラフはMA002と重複するため省略）
     if has_member_data_ml:
-
-        # Find latest month with data for snapshot
         latest_member_month = None
         for row in reversed(monthly_data):
             if row["member_count_ml"] > 0:
                 latest_member_month = row
                 break
 
-        # KPI row for latest month
         if latest_member_month:
-            mk1, mk2, mk3, mk4 = st.columns(4)
-            with mk1:
-                st.metric("全会員数", f"{latest_member_month['member_count_ml']}名",
-                          help=f"{latest_member_month['month_label']}時点")
-            with mk2:
-                st.metric("有効在籍数", f"{latest_member_month['member_active_ml']}名")
-            with mk3:
-                st.metric("新規入会", f"{latest_member_month['member_new_ml']}名")
-            with mk4:
-                st.metric("体験", f"{latest_member_month['member_trial_ml']}名")
-
-        mc1, mc2 = st.columns(2)
-
-        with mc1:
-            # Member count trend (line chart)
-            ml_months = [row["month_label"] for row in monthly_data if row["member_count_ml"] > 0]
-            ml_total = [row["member_count_ml"] for row in monthly_data if row["member_count_ml"] > 0]
-            ml_active = [row["member_active_ml"] for row in monthly_data if row["member_count_ml"] > 0]
-
-            if ml_months:
-                fig_ml_trend = go.Figure()
-                fig_ml_trend.add_trace(go.Scatter(
-                    x=ml_months, y=ml_total,
-                    mode="lines+markers", name="全会員数",
-                    line=dict(color="#2196F3", width=3),
-                    marker=dict(size=8),
-                ))
-                fig_ml_trend.add_trace(go.Scatter(
-                    x=ml_months, y=ml_active,
-                    mode="lines+markers", name="有効在籍数",
-                    line=dict(color="#4CAF50", width=3),
-                    marker=dict(size=8),
-                ))
-                fig_ml_trend.update_layout(
-                    title="会員数推移", xaxis_title="月", yaxis_title="会員数",
-                    height=380, margin=dict(l=20, r=20, t=40, b=20),
-                )
-                st.plotly_chart(fig_ml_trend, use_container_width=True, key=f"chart_ml_trend_{year}_{store}")
-
-        with mc2:
-            # Plan breakdown (horizontal bar) — use latest month with data
-            plan_data = latest_member_month.get("member_active_by_plan", {}) if latest_member_month else {}
+            plan_data = latest_member_month.get("member_active_by_plan", {})
             if not plan_data:
-                plan_data = latest_member_month.get("member_by_plan", {}) if latest_member_month else {}
+                plan_data = latest_member_month.get("member_by_plan", {})
 
             if plan_data:
                 plans_sorted = sorted(plan_data.items(), key=lambda x: x[1])
@@ -1197,62 +1437,169 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
                 )
                 st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_bar_{year}_{store}")
 
-        # New member trend by month (bar chart)
-        ml_new_months = [row["month_label"] for row in monthly_data if row["member_count_ml"] > 0]
-        ml_new_counts = [row["member_new_ml"] for row in monthly_data if row["member_count_ml"] > 0]
-        ml_trial_counts = [row["member_trial_ml"] for row in monthly_data if row["member_count_ml"] > 0]
+    # ===== Budget vs Actual trend (annual/half-year) =====
+    if store and store != "全体":
+        rev_items = ["月会費収入", "パーソナル・物販・その他収入", "サービス収入", "自販機手数料収入"]
+        labor_items = ["正社員・契約社員給与", "賞与", "通勤手当", "法定福利費"]
 
-        if ml_new_months and any(c > 0 for c in ml_new_counts + ml_trial_counts):
-            mc3, mc4 = st.columns(2)
+        ba_months = []
+        ba_rev_budget = []
+        ba_rev_actual = []
+        ba_labor_budget = []
+        ba_labor_actual = []
+        ba_exp_budget = []
+        ba_exp_actual = []
+        ba_profit_budget = []
+        ba_profit_actual = []
 
-            with mc3:
-                fig_new = go.Figure()
-                fig_new.add_trace(go.Bar(
-                    x=ml_new_months, y=ml_new_counts,
-                    name="新規入会", marker_color="#FF9800",
-                    text=ml_new_counts, textposition="auto",
-                ))
-                fig_new.update_layout(
-                    title="新規入会数推移", xaxis_title="月", yaxis_title="人数",
-                    height=350, margin=dict(l=20, r=20, t=40, b=20),
-                )
-                st.plotly_chart(fig_new, use_container_width=True, key=f"chart_new_trend_{year}_{store}")
+        for ba_year, ba_m in ym_list:
+            b_records = get_budget_data(store=store, year=ba_year, month=ba_m)
+            if not b_records:
+                continue
+            b_map = {r["category"]: r["amount"] for r in b_records}
 
-            with mc4:
-                # Store breakdown (bar) — only for 全体 view
-                if store == "全体" and latest_member_month and latest_member_month["member_by_store"]:
-                    by_store = latest_member_month["member_by_store"]
-                    stores_sorted = sorted(by_store.items(), key=lambda x: -x[1])
-                    fig_mem_store = go.Figure()
-                    fig_mem_store.add_trace(go.Bar(
-                        x=[s[0] for s in stores_sorted],
-                        y=[s[1] for s in stores_sorted],
-                        marker_color="#2196F3",
-                        text=[s[1] for s in stores_sorted],
-                        textposition="auto",
-                    ))
-                    fig_mem_store.update_layout(
-                        title=f"店舗別会員数（{latest_member_month['month_label']}）",
-                        xaxis_title="店舗", yaxis_title="会員数",
-                        height=350, margin=dict(l=20, r=20, t=40, b=20),
-                    )
-                    st.plotly_chart(fig_mem_store, use_container_width=True, key=f"chart_mem_store_{year}_{store}")
+            m_rev_b = sum(b_map.get(i, 0) for i in rev_items)
+            m_lab_b = sum(b_map.get(i, 0) for i in labor_items)
+            m_exp_b = sum(v for k, v in b_map.items() if k not in rev_items and k not in labor_items)
+
+            m_rev_a = 0
+            m_lab_a = 0
+            m_exp_a = 0
+            for item in BUDGET_ITEMS:
+                actual = _compute_actual(item, ba_year, ba_m, store)
+                if item in rev_items:
+                    m_rev_a += actual
+                elif item in labor_items:
+                    m_lab_a += actual
                 else:
-                    fig_trial = go.Figure()
-                    fig_trial.add_trace(go.Bar(
-                        x=ml_new_months, y=ml_trial_counts,
-                        name="体験", marker_color="#9C27B0",
-                        text=ml_trial_counts, textposition="auto",
-                    ))
-                    fig_trial.update_layout(
-                        title="体験数推移", xaxis_title="月", yaxis_title="人数",
-                        height=350, margin=dict(l=20, r=20, t=40, b=20),
-                    )
-                    st.plotly_chart(fig_trial, use_container_width=True, key=f"chart_trial_trend_{year}_{store}")
+                    m_exp_a += actual
+
+            ba_months.append(f"{ba_m}月")
+            ba_rev_budget.append(m_rev_b)
+            ba_rev_actual.append(m_rev_a)
+            ba_labor_budget.append(m_lab_b)
+            ba_labor_actual.append(m_lab_a)
+            ba_exp_budget.append(m_exp_b)
+            ba_exp_actual.append(m_exp_a)
+            ba_profit_budget.append(m_rev_b - m_lab_b - m_exp_b)
+            ba_profit_actual.append(m_rev_a - m_lab_a - m_exp_a)
+
+        if ba_months:
+            st.markdown("---")
+            st.subheader("予算実績対比")
+
+            # KPI: period totals
+            sum_rev_b = sum(ba_rev_budget)
+            sum_rev_a = sum(ba_rev_actual)
+            sum_lab_b = sum(ba_labor_budget)
+            sum_lab_a = sum(ba_labor_actual)
+            sum_exp_b = sum(ba_exp_budget)
+            sum_exp_a = sum(ba_exp_actual)
+            sum_prof_b = sum(ba_profit_budget)
+            sum_prof_a = sum(ba_profit_actual)
+
+            bk1, bk2, bk3, bk4 = st.columns(4)
+            with bk1:
+                pct = sum_rev_a / sum_rev_b * 100 if sum_rev_b else 0
+                st.metric("売上 達成率", f"{pct:.0f}%",
+                          delta=f"¥{sum_rev_a - sum_rev_b:+,.0f}" if sum_rev_b else None)
+            with bk2:
+                pct = sum_lab_a / sum_lab_b * 100 if sum_lab_b else 0
+                st.metric("人件費 予算比", f"{pct:.0f}%",
+                          delta=f"¥{sum_lab_a - sum_lab_b:+,.0f}" if sum_lab_b else None,
+                          delta_color="inverse")
+            with bk3:
+                pct = sum_exp_a / sum_exp_b * 100 if sum_exp_b else 0
+                st.metric("経費 予算比", f"{pct:.0f}%",
+                          delta=f"¥{sum_exp_a - sum_exp_b:+,.0f}" if sum_exp_b else None,
+                          delta_color="inverse")
+            with bk4:
+                st.metric("営業利益 予算差", f"¥{sum_prof_a - sum_prof_b:+,.0f}",
+                          delta=f"予算¥{sum_prof_b:,.0f}" if sum_prof_b else None,
+                          delta_color="off")
+
+            # Charts: Revenue budget vs actual, Profit budget vs actual
+            _ba_legend = dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, font=dict(size=11))
+
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                fig_ba_rev = go.Figure()
+                fig_ba_rev.add_trace(go.Bar(
+                    x=ba_months, y=ba_rev_budget, name="予算",
+                    marker_color="#B0BEC5", opacity=0.7,
+                ))
+                fig_ba_rev.add_trace(go.Bar(
+                    x=ba_months, y=ba_rev_actual, name="実績",
+                    marker_color="#2196F3",
+                ))
+                fig_ba_rev.update_layout(
+                    barmode="group", title="売上 予算 vs 実績",
+                    yaxis_title="円", height=380,
+                    margin=dict(l=20, r=20, t=40, b=20), legend=_ba_legend,
+                )
+                st.plotly_chart(fig_ba_rev, use_container_width=True,
+                               key=f"chart_ba_rev_{year}_{store}_{list(month_range)[0]}")
+
+            with bc2:
+                fig_ba_prof = go.Figure()
+                fig_ba_prof.add_trace(go.Scatter(
+                    x=ba_months, y=ba_profit_budget, name="予算",
+                    mode="lines+markers", line=dict(color="#B0BEC5", width=2, dash="dash"),
+                    marker=dict(size=6),
+                ))
+                fig_ba_prof.add_trace(go.Scatter(
+                    x=ba_months, y=ba_profit_actual, name="実績",
+                    mode="lines+markers", line=dict(color="#4CAF50", width=3),
+                    marker=dict(size=8),
+                ))
+                fig_ba_prof.update_layout(
+                    title="営業利益 予算 vs 実績",
+                    yaxis_title="円", height=380,
+                    margin=dict(l=20, r=20, t=40, b=20), legend=_ba_legend,
+                )
+                st.plotly_chart(fig_ba_prof, use_container_width=True,
+                               key=f"chart_ba_prof_{year}_{store}_{list(month_range)[0]}")
+
+            bc3, bc4 = st.columns(2)
+            with bc3:
+                fig_ba_lab = go.Figure()
+                fig_ba_lab.add_trace(go.Bar(
+                    x=ba_months, y=ba_labor_budget, name="予算",
+                    marker_color="#B0BEC5", opacity=0.7,
+                ))
+                fig_ba_lab.add_trace(go.Bar(
+                    x=ba_months, y=ba_labor_actual, name="実績",
+                    marker_color="#F44336",
+                ))
+                fig_ba_lab.update_layout(
+                    barmode="group", title="人件費 予算 vs 実績",
+                    yaxis_title="円", height=380,
+                    margin=dict(l=20, r=20, t=40, b=20), legend=_ba_legend,
+                )
+                st.plotly_chart(fig_ba_lab, use_container_width=True,
+                               key=f"chart_ba_lab_{year}_{store}_{list(month_range)[0]}")
+
+            with bc4:
+                fig_ba_exp = go.Figure()
+                fig_ba_exp.add_trace(go.Bar(
+                    x=ba_months, y=ba_exp_budget, name="予算",
+                    marker_color="#B0BEC5", opacity=0.7,
+                ))
+                fig_ba_exp.add_trace(go.Bar(
+                    x=ba_months, y=ba_exp_actual, name="実績",
+                    marker_color="#FF9800",
+                ))
+                fig_ba_exp.update_layout(
+                    barmode="group", title="経費 予算 vs 実績",
+                    yaxis_title="円", height=380,
+                    margin=dict(l=20, r=20, t=40, b=20), legend=_ba_legend,
+                )
+                st.plotly_chart(fig_ba_exp, use_container_width=True,
+                               key=f"chart_ba_exp_{year}_{store}_{list(month_range)[0]}")
 
     # Annual cumulative PL table
     st.markdown("---")
-    st.subheader("年間PL一覧")
+    st.subheader(f"{'年間' if len(list(month_range)) == 12 else '半期'}PL一覧")
 
     table_data = {
         "科目": [
@@ -1293,7 +1640,8 @@ def _render_annual(year: int, store: str, show_payroll_detail: bool = True):
     avg_hours = total_hours / n_data_months
     avg_vals_post = [v / n_data_months for v in total_vals_post]
 
-    table_data["年間合計"] = [_fmt(v) for v in total_vals_pre] + [f"{total_hours:,.1f}h"] + [_fmt(v) for v in total_vals_post]
+    total_col_label = "年間合計" if len(list(month_range)) == 12 else "合計"
+    table_data[total_col_label] = [_fmt(v) for v in total_vals_pre] + [f"{total_hours:,.1f}h"] + [_fmt(v) for v in total_vals_post]
     table_data["月平均"] = [_fmt(v) for v in avg_vals_pre] + [f"{avg_hours:,.1f}h"] + [_fmt(v) for v in avg_vals_post]
 
     df_table = pd.DataFrame(table_data)
@@ -1334,9 +1682,14 @@ def render(user=None):
     col_year, col_period, col_store = st.columns(3)
 
     with col_year:
-        selected_year = st.selectbox("年度", years, index=len(years) - 1, key="dash_year")
+        selected_year = st.selectbox("年", years, index=len(years) - 1, key="dash_year")
 
-    period_options = ["年間"] + [f"{m}月" for m in range(1, 13)]
+    period_options = [
+        "期（10〜9月）",
+        "年間（1〜12月）",
+        "上期（1〜6月）",
+        "下期（7〜12月）",
+    ] + [f"{m}月" for m in range(1, 13)]
 
     with col_period:
         selected_period = st.selectbox("期間", period_options, key="dash_period")
@@ -1349,8 +1702,14 @@ def render(user=None):
 
     show_payroll_detail = _can_view_payroll_detail(user, selected_store)
 
-    if selected_period == "年間":
+    if selected_period == "期（10〜9月）":
+        _render_fiscal_year(selected_year, selected_store, show_payroll_detail=show_payroll_detail)
+    elif selected_period == "年間（1〜12月）":
         _render_annual(selected_year, selected_store, show_payroll_detail=show_payroll_detail)
+    elif selected_period == "上期（1〜6月）":
+        _render_half_year(selected_year, "上期", selected_store, show_payroll_detail=show_payroll_detail)
+    elif selected_period == "下期（7〜12月）":
+        _render_half_year(selected_year, "下期", selected_store, show_payroll_detail=show_payroll_detail)
     else:
         month = int(selected_period.replace("月", ""))
         _render_monthly(selected_year, month, selected_store, show_payroll_detail=show_payroll_detail)

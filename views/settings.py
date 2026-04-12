@@ -2,10 +2,16 @@
 
 import streamlit as st
 import pandas as pd
+import io
+import csv
+
 from database import (
     get_all_overrides, upsert_override, delete_override,
     get_all_expense_rules, upsert_expense_rule, delete_expense_rule,
     get_all_users, create_user, delete_user,
+    get_all_product_master, upsert_product_master, delete_product_master,
+    get_product_master_category,
+    AMAZON_CATEGORY_DEFAULT_MAP,
     get_connection,
     STORES, HQ_STORE, EXPENSE_CATEGORIES,
 )
@@ -30,9 +36,9 @@ def render(user=None):
     is_admin = user and user.get("role") == "admin"
 
     if is_admin:
-        tab_store, tab_expense, tab_users = st.tabs(["従業員→店舗マッピング", "経費分類ルール", "ユーザー管理"])
+        tab_store, tab_expense, tab_amazon, tab_users = st.tabs(["従業員→店舗マッピング", "経費分類ルール", "Amazon商品マスタ", "ユーザー管理"])
     else:
-        tab_store, tab_expense = st.tabs(["従業員→店舗マッピング", "経費分類ルール"])
+        tab_store, tab_expense, tab_amazon = st.tabs(["従業員→店舗マッピング", "経費分類ルール", "Amazon商品マスタ"])
 
     # ─── Store Override Settings ─────────────────────────────────
     with tab_store:
@@ -44,6 +50,31 @@ def render(user=None):
 
         overrides = get_all_overrides()
         emp_names = _get_employee_names()
+
+        # Auto-register all employees button
+        override_ids = set(int(r["employee_id"]) for r in overrides)
+        all_emp_ids = set(int(eid) for eid in emp_names.keys())
+        unregistered = all_emp_ids - override_ids
+
+        if unregistered:
+            from database import THOUSAND_DIGIT_MAP
+            st.warning(f"⚠️ 給与データに {len(unregistered)}名の未登録従業員がいます（千の位ルールで自動判定中）")
+            if st.button(f"▶ 未登録 {len(unregistered)}名を一括登録", type="primary", key="btn_auto_register_all"):
+                registered = 0
+                skipped = 0
+                for eid in sorted(unregistered):
+                    td = eid // 1000
+                    store = THOUSAND_DIGIT_MAP.get(td, "")
+                    if store:
+                        upsert_override(eid, store, 100)
+                        registered += 1
+                    else:
+                        skipped += 1
+                msg = f"✅ {registered}名を登録しました"
+                if skipped:
+                    msg += f"（{skipped}名は店舗判定できずスキップ）"
+                st.success(msg)
+                st.rerun()
 
         search_query = st.text_input("🔍 従業員検索（番号 or 氏名）", key="emp_search", placeholder="例: 4005 or 田中")
 
@@ -314,6 +345,167 @@ def render(user=None):
                     st.rerun()
                 else:
                     st.error("キーワードを入力してください。")
+
+    # ─── Amazon Product Master ───────────────────────────────────
+    with tab_amazon:
+        st.subheader("Amazon商品マスタ")
+        st.caption(
+            "ASINごとに勘定科目を記録。Amazon注文CSV取込時に自動学習されます。"
+            "ここで手動編集・追加・削除も可能です。"
+        )
+
+        masters = get_all_product_master()
+
+        if masters:
+            search_asin = st.text_input("🔍 検索（ASIN or 商品名）", key="master_search", placeholder="例: B08XXX or マスク")
+
+            filtered = masters
+            if search_asin and search_asin.strip():
+                q = search_asin.strip().lower()
+                filtered = [
+                    m for m in masters
+                    if q in m.get("asin", "").lower() or q in m.get("product_name", "").lower()
+                ]
+
+            master_data = []
+            for m in filtered:
+                master_data.append({
+                    "id": m["id"],
+                    "ASIN": m["asin"],
+                    "商品名": m.get("product_name", "")[:40],
+                    "Amazonカテゴリ": m.get("amazon_category", ""),
+                    "勘定科目": m.get("expense_category", ""),
+                    "最終取込日": m.get("last_seen_date", ""),
+                    "削除": False,
+                })
+
+            df_master = pd.DataFrame(master_data)
+
+            edited_master = st.data_editor(
+                df_master[["ASIN", "商品名", "Amazonカテゴリ", "勘定科目", "最終取込日", "削除"]],
+                column_config={
+                    "ASIN": st.column_config.TextColumn("ASIN", disabled=True),
+                    "商品名": st.column_config.TextColumn("商品名", disabled=True, width="large"),
+                    "Amazonカテゴリ": st.column_config.TextColumn("Amazonカテゴリ", disabled=True),
+                    "勘定科目": st.column_config.SelectboxColumn("勘定科目", options=EXPENSE_CATEGORIES, required=True),
+                    "最終取込日": st.column_config.TextColumn("最終取込日", disabled=True),
+                    "削除": st.column_config.CheckboxColumn("削除", default=False),
+                },
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="master_editor",
+            )
+
+            if st.button("💾 変更を保存", type="primary", key="btn_save_master"):
+                deleted = 0
+                updated = 0
+                for i, row in edited_master.iterrows():
+                    orig = master_data[i]
+                    db_id = orig["id"]
+
+                    if row["削除"]:
+                        delete_product_master(db_id)
+                        deleted += 1
+                        continue
+
+                    if row["勘定科目"] != orig["勘定科目"]:
+                        m = filtered[i]
+                        upsert_product_master(
+                            m["asin"], m.get("product_name", ""),
+                            m.get("amazon_category", ""), row["勘定科目"],
+                        )
+                        updated += 1
+
+                msgs = []
+                if updated > 0:
+                    msgs.append(f"{updated}件更新")
+                if deleted > 0:
+                    msgs.append(f"{deleted}件削除")
+                if msgs:
+                    st.success(f"✅ {', '.join(msgs)}しました")
+                    st.rerun()
+                else:
+                    st.info("変更はありません")
+
+            st.metric("登録済み商品数", f"{len(masters)}件")
+        else:
+            st.info("商品マスタは空です。Amazon注文CSVを取り込むと自動で登録されます。")
+
+        # CSV bulk import to master
+        st.markdown("---")
+        with st.expander("📥 注文履歴CSVから一括登録", expanded=False):
+            st.caption(
+                "過去のAmazonビジネス注文履歴CSVをアップロードすると、"
+                "ASIN・商品名・カテゴリを商品マスタに一括登録します（注文データは保存しません）。"
+                "既にマスタに登録済みのASINは勘定科目を上書きしません。"
+            )
+            master_csv = st.file_uploader("Amazon注文履歴CSV", type=["csv"], key="master_csv_upload")
+            apply_default_cat = st.checkbox(
+                "Amazonカテゴリから勘定科目の初期値を自動セット",
+                value=True,
+                key="master_csv_apply_default",
+            )
+            if master_csv is not None:
+                if st.button("▶ 商品マスタに一括登録", type="primary", key="btn_master_csv_import"):
+                    raw = master_csv.read()
+                    text = None
+                    for enc in ["utf-8-sig", "utf-8", "cp932"]:
+                        try:
+                            text = raw.decode(enc)
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    if text is None:
+                        st.error("CSVのエンコーディングを判定できませんでした")
+                    else:
+                        reader = csv.DictReader(io.StringIO(text))
+                        fieldnames = [f.strip().strip('\ufeff') for f in (reader.fieldnames or [])]
+                        reader.fieldnames = fieldnames
+
+                        if 'ASIN' not in fieldnames:
+                            st.error("ASIN列が見つかりません。Amazonビジネスの注文履歴CSVを使用してください。")
+                        else:
+                            new_count = 0
+                            skip_count = 0
+                            for row in reader:
+                                asin = (row.get('ASIN') or '').strip()
+                                if not asin:
+                                    continue
+                                existing = get_product_master_category(asin)
+                                if existing:
+                                    skip_count += 1
+                                    continue
+                                product_name = (row.get('商品名') or '').strip()
+                                amazon_cat = (row.get('商品カテゴリー') or '').strip()
+                                expense_cat = ""
+                                if apply_default_cat:
+                                    expense_cat = AMAZON_CATEGORY_DEFAULT_MAP.get(amazon_cat, "")
+                                if not expense_cat:
+                                    expense_cat = "消耗品費"
+                                upsert_product_master(asin, product_name, amazon_cat, expense_cat)
+                                new_count += 1
+                            st.success(f"✅ 新規 {new_count}件を商品マスタに登録（{skip_count}件は登録済みのためスキップ）")
+                            if new_count > 0:
+                                st.rerun()
+
+        # Manual add
+        st.markdown("---")
+        with st.expander("➕ 手動で商品を追加", expanded=False):
+            ma_col1, ma_col2, ma_col3 = st.columns([2, 3, 2])
+            with ma_col1:
+                new_asin = st.text_input("ASIN", key="new_master_asin")
+            with ma_col2:
+                new_pname = st.text_input("商品名（参考）", key="new_master_pname")
+            with ma_col3:
+                new_pcat = st.selectbox("勘定科目", EXPENSE_CATEGORIES, key="new_master_cat")
+            if st.button("追加", type="primary", key="btn_add_master"):
+                if new_asin.strip():
+                    upsert_product_master(new_asin.strip(), new_pname.strip(), "", new_pcat)
+                    st.success(f"✅ {new_asin.strip()} → {new_pcat}")
+                    st.rerun()
+                else:
+                    st.error("ASINを入力してください。")
 
     # ─── User Management (admin only) ──────────────────────────
     if is_admin:

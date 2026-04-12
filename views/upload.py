@@ -15,7 +15,10 @@ from database import (
     classify_sale_category, SALES_CATEGORIES,
     upsert_override, STORES, HQ_STORE, EXPENSE_CATEGORIES,
     save_amazon_orders, get_amazon_order_count,
-    detect_store_from_address, match_amazon_breakdown,
+    detect_store_from_address, detect_store_from_account_user,
+    match_amazon_breakdown,
+    get_product_master_category, upsert_product_master,
+    AMAZON_CATEGORY_DEFAULT_MAP,
     check_payroll_exists, check_expense_exists,
     check_member_exists, check_sales_detail_exists,
     check_monthly_summary_exists, upsert_expense_rule,
@@ -95,7 +98,7 @@ def _parse_ml001_csv(
     # Build column index map (header name → index)
     hmap = {}
     for i, h in enumerate(header):
-        hmap[h.strip()] = i
+        hmap[h.strip().strip('\ufeff')] = i
 
     # Key column indices — try header name first, fall back to known positions
     def _col(name: str, fallback: int) -> int:
@@ -570,8 +573,30 @@ def _shorten_product_name(name: str, max_len: int = 30) -> str:
     return short
 
 
+def _parse_amazon_int(val_str) -> int:
+    if not val_str:
+        return 0
+    cleaned = val_str.strip().replace(',', '').replace('"', '').replace('=', '').replace('￥', '').replace('¥', '')
+    if not cleaned or cleaned == '該当なし':
+        return 0
+    try:
+        return int(float(cleaned))
+    except ValueError:
+        return 0
+
+
+def _get_csv_val(row: dict, key: str) -> str:
+    """Get a value from a CSV DictReader row, stripping whitespace."""
+    val = row.get(key, "")
+    return val.strip() if val else ""
+
+
 def parse_amazon_csv(file_bytes: bytes) -> list[dict]:
-    """Parse Amazon order history CSV and return order records."""
+    """Parse Amazon Business order history CSV and return order records.
+
+    Supports both Amazon Business format (with ASIN, account user, tax details)
+    and legacy personal Amazon format (fallback).
+    """
     text = None
     for enc in ["utf-8-sig", "utf-8", "cp932"]:
         try:
@@ -582,100 +607,100 @@ def parse_amazon_csv(file_bytes: bytes) -> list[dict]:
     if text is None:
         raise ValueError("CSVのエンコーディングを判定できませんでした")
 
-    reader = csv.reader(io.StringIO(text))
-    header = next(reader)
+    reader = csv.DictReader(io.StringIO(text))
+    fieldnames = [f.strip().strip('\ufeff') for f in (reader.fieldnames or [])]
+    reader.fieldnames = fieldnames
 
-    # Build column index map
-    col_map = {}
-    for i, h in enumerate(header):
-        h_clean = h.strip().strip('\ufeff')
-        if h_clean == '注文日':
-            col_map['order_date'] = i
-        elif h_clean == '注文番号':
-            col_map['order_id'] = i
-        elif h_clean == '商品名':
-            col_map['product_name'] = i
-        elif h_clean == '注文状況':
-            col_map['status'] = i
-        elif h_clean == '注文の合計（税込）':
-            col_map['order_total'] = i
-        elif h_clean == '支払い金額':
-            col_map['payment_amount'] = i
-        elif h_clean == '支払い確定日':
-            col_map['payment_date'] = i
-        elif h_clean == '商品の小計（税込）':
-            col_map['item_amount'] = i
-        elif h_clean.startswith('発送商品の') and '合計' in h_clean and '税込' in h_clean:
-            col_map['ship_total'] = i
-
-    def _parse_int(val_str):
-        if not val_str:
-            return 0
-        cleaned = val_str.strip().replace(',', '').replace('"', '').replace('=', '').replace('￥', '').replace('¥', '')
-        if not cleaned or cleaned == '該当なし':
-            return 0
-        try:
-            return int(cleaned)
-        except ValueError:
-            return 0
+    is_business = 'ASIN' in fieldnames and 'アカウントユーザー' in fieldnames
 
     orders = []
     for row in reader:
-        if len(row) < 10:
+        status = _get_csv_val(row, '注文状況')
+        if 'キャンセル' in status:
             continue
 
-        # Skip cancelled orders
-        status_idx = col_map.get('status', -1)
-        if 0 <= status_idx < len(row) and 'キャンセル' in row[status_idx]:
-            continue
-
-        order_date = row[col_map.get('order_date', 0)].strip() if 'order_date' in col_map else ""
-        order_id = row[col_map.get('order_id', 1)].strip() if 'order_id' in col_map else ""
-        product_name = row[col_map.get('product_name', -1)].strip() if 'product_name' in col_map else ""
-
-        # Order total (what PayPay charges)
-        order_total = 0
-        for key in ['payment_amount', 'order_total']:
-            if key in col_map:
-                order_total = _parse_int(row[col_map[key]])
-                if order_total > 0:
-                    break
-
-        # Individual item amount
-        item_amount = 0
-        for key in ['item_amount', 'ship_total']:
-            if key in col_map:
-                item_amount = _parse_int(row[col_map[key]])
-                if item_amount > 0:
-                    break
-
-        # Payment date
-        payment_date = row[col_map['payment_date']].strip() if 'payment_date' in col_map and col_map['payment_date'] < len(row) else ""
-
-        # Find delivery address - scan row for ハイアルチ or HAIARUCHI
-        delivery_address = ""
-        for cell in row:
-            if 'ハイアルチ' in cell or 'HAIARUCHI' in cell.upper():
-                delivery_address = cell
-                break
-
+        order_id = _get_csv_val(row, '注文番号')
+        product_name = _get_csv_val(row, '商品名')
         if not order_id or not product_name:
             continue
 
-        store = detect_store_from_address(delivery_address)
+        order_date = _get_csv_val(row, '注文日')
+        payment_date = _get_csv_val(row, '支払い確定日')
         short_name = _shorten_product_name(product_name)
 
-        orders.append({
-            "order_date": order_date,
-            "order_id": order_id,
-            "store_name": store,
-            "product_name": product_name,
-            "short_name": short_name,
-            "amount": item_amount or order_total,
-            "order_total": order_total,
-            "payment_date": payment_date,
-            "delivery_address": delivery_address,
-        })
+        if is_business:
+            asin = _get_csv_val(row, 'ASIN')
+            amazon_category = _get_csv_val(row, '商品カテゴリー')
+            account_user = _get_csv_val(row, 'アカウントユーザー')
+            delivery_address = _get_csv_val(row, '配送先住所')
+            quantity = _parse_amazon_int(_get_csv_val(row, '商品の数量')) or 1
+            item_amount = _parse_amazon_int(_get_csv_val(row, '商品および配送料の合計（税込）'))
+            if not item_amount:
+                item_amount = _parse_amazon_int(_get_csv_val(row, '商品の小計（税込）'))
+            order_total = _parse_amazon_int(_get_csv_val(row, '注文の合計（税込）'))
+            tax_amount = _parse_amazon_int(_get_csv_val(row, '商品の小計（消費税）'))
+            tax_rate = _get_csv_val(row, '商品の小計（税率）')
+            invoice_number = _get_csv_val(row, '適格請求書（または支払い明細書）番号')
+
+            store = detect_store_from_account_user(account_user)
+            if not store:
+                store = detect_store_from_address(delivery_address)
+
+            expense_category = get_product_master_category(asin) or ""
+
+            orders.append({
+                "order_date": order_date,
+                "order_id": order_id,
+                "store_name": store,
+                "product_name": product_name,
+                "short_name": short_name,
+                "amount": item_amount or order_total,
+                "order_total": order_total,
+                "payment_date": payment_date,
+                "delivery_address": delivery_address,
+                "asin": asin,
+                "amazon_category": amazon_category,
+                "expense_category": expense_category,
+                "quantity": quantity,
+                "tax_amount": tax_amount,
+                "tax_rate": tax_rate,
+                "account_user": account_user,
+                "invoice_number": invoice_number,
+            })
+        else:
+            # Legacy personal Amazon CSV fallback
+            order_total = _parse_amazon_int(_get_csv_val(row, '支払い金額'))
+            if not order_total:
+                order_total = _parse_amazon_int(_get_csv_val(row, '注文の合計（税込）'))
+            item_amount = _parse_amazon_int(_get_csv_val(row, '商品の小計（税込）'))
+
+            delivery_address = ""
+            for cell in row.values():
+                if cell and ('ハイアルチ' in cell or 'HAIARUCHI' in str(cell).upper()):
+                    delivery_address = cell
+                    break
+
+            store = detect_store_from_address(delivery_address)
+
+            orders.append({
+                "order_date": order_date,
+                "order_id": order_id,
+                "store_name": store,
+                "product_name": product_name,
+                "short_name": short_name,
+                "amount": item_amount or order_total,
+                "order_total": order_total,
+                "payment_date": payment_date,
+                "delivery_address": delivery_address,
+                "asin": "",
+                "amazon_category": "",
+                "expense_category": "",
+                "quantity": 1,
+                "tax_amount": 0,
+                "tax_rate": "",
+                "account_user": "",
+                "invoice_number": "",
+            })
 
     return orders
 
@@ -847,24 +872,97 @@ def render(user=None):
 
         if not skip_amazon and not amazon_just_imported:
             uploaded_amazon = st.file_uploader(
-                "Amazon注文履歴CSVをアップロード",
+                "Amazonビジネス注文履歴CSVをアップロード",
                 type=["csv"],
                 key="amazon_upload",
             )
 
             if uploaded_amazon is not None:
-                if st.button("▶ 取り込む", type="primary", key="btn_amazon_import"):
-                    with st.spinner("Amazon CSV 解析中..."):
-                        amazon_bytes = uploaded_amazon.read()
-                        amazon_records = parse_amazon_csv(amazon_bytes)
+                if "amazon_parsed" not in st.session_state:
+                    if st.button("▶ 解析する", type="primary", key="btn_amazon_parse"):
+                        with st.spinner("Amazon CSV 解析中..."):
+                            amazon_bytes = uploaded_amazon.read()
+                            amazon_records = parse_amazon_csv(amazon_bytes)
+                        if amazon_records:
+                            st.session_state["amazon_parsed"] = amazon_records
+                            st.rerun()
+                        else:
+                            st.warning("取り込めるデータが見つかりませんでした。")
 
-                    if amazon_records:
-                        save_amazon_orders(amazon_records)
+                if "amazon_parsed" in st.session_state:
+                    records = st.session_state["amazon_parsed"]
+                    auto_count = sum(1 for r in records if r["expense_category"])
+                    manual_count = len(records) - auto_count
+
+                    st.info(f"📦 {len(records)}件の商品を検出。自動分類: **{auto_count}件** / 未分類: **{manual_count}件**")
+
+                    # Show table with category assignment
+                    cat_options = [""] + EXPENSE_CATEGORIES
+                    display_data = []
+                    for i, r in enumerate(records):
+                        display_data.append({
+                            "idx": i,
+                            "注文日": r["order_date"],
+                            "店舗": r["store_name"],
+                            "商品名": r["short_name"] or r["product_name"][:30],
+                            "ASIN": r["asin"],
+                            "Amazonカテゴリ": r["amazon_category"],
+                            "金額": f"¥{r['amount']:,}",
+                            "数量": r["quantity"],
+                            "勘定科目": r["expense_category"],
+                        })
+                    df_amazon = pd.DataFrame(display_data)
+
+                    edited_amazon = st.data_editor(
+                        df_amazon[["注文日", "店舗", "商品名", "ASIN", "Amazonカテゴリ", "金額", "数量", "勘定科目"]],
+                        column_config={
+                            "注文日": st.column_config.TextColumn("注文日", disabled=True),
+                            "店舗": st.column_config.TextColumn("店舗", disabled=True),
+                            "商品名": st.column_config.TextColumn("商品名", disabled=True, width="large"),
+                            "ASIN": st.column_config.TextColumn("ASIN", disabled=True),
+                            "Amazonカテゴリ": st.column_config.TextColumn("Amazonカテゴリ", disabled=True),
+                            "金額": st.column_config.TextColumn("金額", disabled=True),
+                            "数量": st.column_config.NumberColumn("数量", disabled=True),
+                            "勘定科目": st.column_config.SelectboxColumn("勘定科目", options=EXPENSE_CATEGORIES, required=False),
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        num_rows="fixed",
+                        key="amazon_category_editor",
+                    )
+
+                    apply_default = st.checkbox(
+                        "未分類にAmazonカテゴリから初期値を自動セット",
+                        value=True,
+                        key="amazon_apply_default",
+                    )
+
+                    if st.button("▶ 取り込む（商品マスタに学習＆保存）", type="primary", key="btn_amazon_save"):
+                        for i, row in edited_amazon.iterrows():
+                            cat = row["勘定科目"] if row["勘定科目"] else ""
+                            if not cat and apply_default:
+                                cat = AMAZON_CATEGORY_DEFAULT_MAP.get(records[i]["amazon_category"], "")
+                            records[i]["expense_category"] = cat
+
+                            # Learn: save to product master if category is set
+                            if cat and records[i]["asin"]:
+                                upsert_product_master(
+                                    records[i]["asin"],
+                                    records[i]["product_name"],
+                                    records[i]["amazon_category"],
+                                    cat,
+                                )
+
+                        new_count, skip_count = save_amazon_orders(records)
                         st.session_state["amazon_just_imported"] = True
-                        st.session_state["amazon_import_msg"] = f"✅ Amazon注文 {len(amazon_records)} 件を取り込みました"
+                        learned = sum(1 for r in records if r["expense_category"])
+                        st.session_state["amazon_import_msg"] = (
+                            f"✅ Amazon注文 {new_count}件保存（{skip_count}件重複スキップ）。"
+                            f"商品マスタ学習: {learned}件"
+                        )
+                        if "amazon_parsed" in st.session_state:
+                            del st.session_state["amazon_parsed"]
                         st.rerun()
-                    else:
-                        st.warning("取り込めるデータが見つかりませんでした。")
 
         amazon_ready = skip_amazon or amazon_just_imported
 
@@ -1263,7 +1361,7 @@ def render(user=None):
                         # Build column index map
                         hmap = {}
                         for i, h in enumerate(header):
-                            hmap[h.strip()] = i
+                            hmap[h.strip().strip('\ufeff')] = i
 
                         def _pl_get(row, col_name, default=""):
                             idx = hmap.get(col_name)
@@ -1420,7 +1518,7 @@ def render(user=None):
                         # Build column index map
                         hmap = {}
                         for i, h in enumerate(header):
-                            hmap[h.strip()] = i
+                            hmap[h.strip().strip('\ufeff')] = i
 
                         all_rows = list(reader)
                         if not all_rows:

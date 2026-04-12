@@ -385,7 +385,7 @@ def init_db():
         )
     """)
 
-    # Amazon orders table
+    # Amazon orders table (Business format)
     _execute(conn, f"""
         CREATE TABLE IF NOT EXISTS amazon_orders (
             id {auto_id},
@@ -398,7 +398,28 @@ def init_db():
             order_total INTEGER,
             payment_date TEXT,
             delivery_address TEXT,
+            asin TEXT DEFAULT '',
+            amazon_category TEXT DEFAULT '',
+            expense_category TEXT DEFAULT '',
+            quantity INTEGER DEFAULT 1,
+            tax_amount INTEGER DEFAULT 0,
+            tax_rate TEXT DEFAULT '',
+            account_user TEXT DEFAULT '',
+            invoice_number TEXT DEFAULT '',
             UNIQUE(order_id, product_name)
+        )
+    """)
+
+    # Amazon product master — ASIN → expense category learning table
+    _execute(conn, f"""
+        CREATE TABLE IF NOT EXISTS amazon_product_master (
+            id {auto_id},
+            asin TEXT NOT NULL UNIQUE,
+            product_name TEXT DEFAULT '',
+            amazon_category TEXT DEFAULT '',
+            expense_category TEXT NOT NULL,
+            last_seen_date TEXT DEFAULT '',
+            updated_at TEXT DEFAULT ''
         )
     """)
 
@@ -453,6 +474,30 @@ def init_db():
             _execute(conn, "SELECT breakdown FROM expense_data LIMIT 1")
         except sqlite3.OperationalError:
             _execute(conn, "ALTER TABLE expense_data ADD COLUMN breakdown TEXT DEFAULT ''")
+
+    # Migration: amazon_orders new columns
+    amazon_new_cols = [
+        ("asin", "TEXT DEFAULT ''"),
+        ("amazon_category", "TEXT DEFAULT ''"),
+        ("expense_category", "TEXT DEFAULT ''"),
+        ("quantity", "INTEGER DEFAULT 1"),
+        ("tax_amount", "INTEGER DEFAULT 0"),
+        ("tax_rate", "TEXT DEFAULT ''"),
+        ("account_user", "TEXT DEFAULT ''"),
+        ("invoice_number", "TEXT DEFAULT ''"),
+    ]
+    if _is_pg():
+        for col, coldef in amazon_new_cols:
+            try:
+                _execute(conn, f"ALTER TABLE amazon_orders ADD COLUMN {col} {coldef}")
+            except Exception:
+                conn.rollback()
+    else:
+        for col, coldef in amazon_new_cols:
+            try:
+                _execute(conn, f"SELECT {col} FROM amazon_orders LIMIT 1")
+            except sqlite3.OperationalError:
+                _execute(conn, f"ALTER TABLE amazon_orders ADD COLUMN {col} {coldef}")
 
     conn.commit()
 
@@ -1333,7 +1378,48 @@ AMAZON_STORE_MAP = {
     "下北沢": "下北沢",
     "春日": "春日",
     "中目黒": "中目黒",
+    "東陽町": "東陽町",
 }
+
+# Account user name → store (Amazon Business CSV)
+AMAZON_ACCOUNT_USER_MAP = {
+    "東日本橋スタジオ": "東日本橋",
+    "春日スタジオ": "春日",
+    "船橋スタジオ": "船橋",
+    "巣鴨スタジオ": "巣鴨",
+    "ハイアルチ祖師ヶ谷大蔵スタジオ": "祖師ヶ谷大蔵",
+    "下北沢スタジオ": "下北沢",
+    "中目黒スタジオ": "中目黒",
+    "東陽町スタジオ": "東陽町",
+    "High Altitude Management株式会社": "本部",
+}
+
+# Amazon category → default expense category
+AMAZON_CATEGORY_DEFAULT_MAP = {
+    "Grocery": "消耗品費",
+    "Health and Beauty": "消耗品費",
+    "Beauty": "消耗品費",
+    "Prestige Beauty": "消耗品費",
+    "Home": "消耗品費",
+    "Home Improvement": "消耗品費",
+    "Kitchen": "消耗品費",
+    "Office Product": "消耗品費",
+    "Sports": "消耗品費",
+    "Toy": "雑費",
+    "CE": "消耗品費",
+    "Personal Computer": "消耗品費",
+    "Business, Industrial, & Scientific Supplies Basic": "消耗品費",
+    "Shoes": "消耗品費",
+    "Gift Card": "その他",
+    "Mobile Application": "通信費",
+}
+
+
+def detect_store_from_account_user(account_user: str) -> str:
+    """Detect store from Amazon Business account user name (highest priority)."""
+    if not account_user:
+        return ""
+    return AMAZON_ACCOUNT_USER_MAP.get(account_user.strip(), "")
 
 
 def detect_store_from_address(address: str) -> str:
@@ -1356,9 +1442,13 @@ def save_amazon_orders(orders: list[dict]) -> tuple[int, int]:
 
     insert_sql = """INSERT INTO amazon_orders
                (order_date, order_id, store_name, product_name, short_name,
-                amount, order_total, payment_date, delivery_address)
+                amount, order_total, payment_date, delivery_address,
+                asin, amazon_category, expense_category, quantity,
+                tax_amount, tax_rate, account_user, invoice_number)
                VALUES (:order_date, :order_id, :store_name, :product_name, :short_name,
-                       :amount, :order_total, :payment_date, :delivery_address)"""
+                       :amount, :order_total, :payment_date, :delivery_address,
+                       :asin, :amazon_category, :expense_category, :quantity,
+                       :tax_amount, :tax_rate, :account_user, :invoice_number)"""
 
     for o in orders:
         try:
@@ -1367,8 +1457,7 @@ def save_amazon_orders(orders: list[dict]) -> tuple[int, int]:
             new_count += 1
         except (sqlite3.IntegrityError, Exception) as e:
             if _is_pg():
-                conn.rollback()  # PG needs rollback after integrity error
-            # Check if it's actually an integrity error for PG
+                conn.rollback()
             if _is_pg() and HAS_PSYCOPG2:
                 if isinstance(e, psycopg2.IntegrityError):
                     skip_count += 1
@@ -1388,6 +1477,79 @@ def get_amazon_order_count() -> int:
     row = _fetchone(conn, "SELECT COUNT(*) as cnt FROM amazon_orders")
     conn.close()
     return row["cnt"]
+
+
+# ─── Amazon Product Master CRUD ─────────────────────────────────────
+
+def get_product_master_category(asin: str) -> str | None:
+    """Look up expense category for an ASIN. Returns None if not found."""
+    if not asin:
+        return None
+    conn = get_connection()
+    row = _fetchone(conn,
+        _ph("SELECT expense_category FROM amazon_product_master WHERE asin = ?"),
+        (asin,),
+    )
+    conn.close()
+    if row:
+        return row["expense_category"]
+    return None
+
+
+def upsert_product_master(asin: str, product_name: str, amazon_category: str, expense_category: str):
+    """Insert or update a product master entry."""
+    from datetime import datetime
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    conn = get_connection()
+    if _is_pg():
+        _execute(conn,
+            """INSERT INTO amazon_product_master (asin, product_name, amazon_category, expense_category, last_seen_date, updated_at)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT(asin)
+               DO UPDATE SET product_name = EXCLUDED.product_name,
+                            amazon_category = EXCLUDED.amazon_category,
+                            expense_category = EXCLUDED.expense_category,
+                            last_seen_date = EXCLUDED.last_seen_date,
+                            updated_at = EXCLUDED.updated_at""",
+            (asin, product_name, amazon_category, expense_category, now, now),
+        )
+    else:
+        _execute(conn,
+            """INSERT INTO amazon_product_master (asin, product_name, amazon_category, expense_category, last_seen_date, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(asin)
+               DO UPDATE SET product_name = excluded.product_name,
+                            amazon_category = excluded.amazon_category,
+                            expense_category = excluded.expense_category,
+                            last_seen_date = excluded.last_seen_date,
+                            updated_at = excluded.updated_at""",
+            (asin, product_name, amazon_category, expense_category, now, now),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_all_product_master() -> list[dict]:
+    conn = get_connection()
+    rows = _fetchall(conn, "SELECT * FROM amazon_product_master ORDER BY updated_at DESC")
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_product_master(master_id: int):
+    conn = get_connection()
+    _execute(conn, _ph("DELETE FROM amazon_product_master WHERE id = ?"), (master_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_amazon_order_category(order_id: int, expense_category: str):
+    """Update expense_category on a specific amazon_orders row."""
+    conn = get_connection()
+    _execute(conn, _ph("UPDATE amazon_orders SET expense_category = ? WHERE id = ?"),
+             (expense_category, order_id))
+    conn.commit()
+    conn.close()
 
 
 def match_amazon_breakdown(description: str, amount: float, day: int, month: int, year: int, store: str) -> str:

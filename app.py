@@ -11,7 +11,7 @@ if str(APP_DIR) not in sys.path:
 import streamlit as st
 
 st.set_page_config(
-    page_title="ハイアルチ PL管理",
+    page_title="ハイアルチ 業績ダッシュボード",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -26,7 +26,7 @@ if "user" not in st.session_state:
     st.session_state["user"] = None
 
 if st.session_state["user"] is None:
-    st.markdown("## ハイアルチ PL管理 — ログイン")
+    st.markdown("## ハイアルチ 業績ダッシュボード — ログイン")
     with st.form("login_form"):
         login_user = st.text_input("ユーザー名")
         login_pass = st.text_input("パスワード", type="password")
@@ -134,7 +134,7 @@ page = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    "<small>High-Alti PL Dashboard v1.0</small>",
+    "<small>High-Alti 業績ダッシュボード v1.0</small>",
     unsafe_allow_html=True,
 )
 
