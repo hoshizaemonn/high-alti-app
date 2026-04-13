@@ -917,16 +917,21 @@ def _render_monthly(year: int, month: int, store: str, show_payroll_detail: bool
                 st.plotly_chart(fig_plan, use_container_width=True, key=f"chart_plan_pie_{year}_{month}_{store}")
 
 
-def _render_half_year(year: int, half: str, store: str, show_payroll_detail: bool = True):
-    """Render half-year PL view. half is '上期' (1-6) or '下期' (7-12)."""
+def _render_half_year(end_year: int, half: str, store: str, show_payroll_detail: bool = True):
+    """Render half-year PL view (fiscal year base).
+
+    上期 = 10月〜3月 (prev_year/10 〜 end_year/3)
+    下期 = 4月〜9月 (end_year/4 〜 end_year/9)
+    """
+    prev_year = end_year - 1
     if half == "上期":
-        months = range(1, 7)
-        label = f"{year}年 上期（1〜6月）"
+        ym_pairs = [(prev_year, m) for m in range(10, 13)] + [(end_year, m) for m in range(1, 4)]
+        label = f"{end_year}/9期 上期（{prev_year}年10月〜{end_year}年3月）"
     else:
-        months = range(7, 13)
-        label = f"{year}年 下期（7〜12月）"
-    _render_annual(year, store, show_payroll_detail=show_payroll_detail,
-                   month_range=months, period_label=label)
+        ym_pairs = [(end_year, m) for m in range(4, 10)]
+        label = f"{end_year}/9期 下期（{end_year}年4月〜9月）"
+    _render_annual_multi(ym_pairs, store, show_payroll_detail=show_payroll_detail,
+                         period_label=label)
 
 
 def _render_fiscal_year(end_year: int, store: str, show_payroll_detail: bool = True):
@@ -1684,12 +1689,13 @@ def render(user=None):
     with col_year:
         selected_year = st.selectbox("年", years, index=len(years) - 1, key="dash_year")
 
+    # Period options: fiscal year based (10月〜9月)
+    month_order = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     period_options = [
-        "期（10〜9月）",
-        "年間（1〜12月）",
-        "上期（1〜6月）",
-        "下期（7〜12月）",
-    ] + [f"{m}月" for m in range(1, 13)]
+        "通期（10〜9月）",
+        "上期（10〜3月）",
+        "下期（4〜9月）",
+    ] + [f"{m}月" for m in month_order]
 
     with col_period:
         selected_period = st.selectbox("期間", period_options, key="dash_period")
@@ -1702,13 +1708,11 @@ def render(user=None):
 
     show_payroll_detail = _can_view_payroll_detail(user, selected_store)
 
-    if selected_period == "期（10〜9月）":
+    if selected_period == "通期（10〜9月）":
         _render_fiscal_year(selected_year, selected_store, show_payroll_detail=show_payroll_detail)
-    elif selected_period == "年間（1〜12月）":
-        _render_annual(selected_year, selected_store, show_payroll_detail=show_payroll_detail)
-    elif selected_period == "上期（1〜6月）":
+    elif selected_period == "上期（10〜3月）":
         _render_half_year(selected_year, "上期", selected_store, show_payroll_detail=show_payroll_detail)
-    elif selected_period == "下期（7〜12月）":
+    elif selected_period == "下期（4〜9月）":
         _render_half_year(selected_year, "下期", selected_store, show_payroll_detail=show_payroll_detail)
     else:
         month = int(selected_period.replace("月", ""))
