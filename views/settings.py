@@ -22,10 +22,11 @@ STORE_OPTIONS_WITH_HQ = STORES + [HQ_STORE]
 
 def _get_employee_names() -> dict:
     """Get employee_id -> name mapping from payroll data."""
+    from database import _fetchall
     conn = get_connection()
-    rows = conn.execute(
+    rows = _fetchall(conn,
         "SELECT DISTINCT employee_id, employee_name FROM payroll_data WHERE employee_name != ''"
-    ).fetchall()
+    )
     conn.close()
     return {str(r["employee_id"]): r["employee_name"] for r in rows}
 
